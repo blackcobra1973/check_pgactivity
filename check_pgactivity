@@ -345,6 +345,7 @@ my %args = (
     'query'                 => undef,
     'type'                  => undef,
     'reverse'               => 0,
+    'strict'                => 0,
     'work_mem'              => undef,
     'maintenance_work_mem'  => undef,
     'shared_buffers'        => undef,
@@ -639,6 +640,17 @@ LOOP_TS: while ( my $val = shift @date ) {
     }
 
     return $ts;
+}
+
+# Take a non standard unit, and return if corrected if the strict mod is
+# required
+#
+sub get_unit($) {
+    my $unit = shift();
+
+    return $unit if (!$args{'strict'} or $unit eq '%' or $unit eq 's' or $unit eq 'B' or $unit eq 'c');
+
+    return '';
 }
 
 =pod
@@ -1178,8 +1190,8 @@ sub check_archive_folder {
     $seg_per_wal++ if $wal_version >= $wal_versions{'93'};
 
     push @perfdata,
-        "latest_archive_age=${latest_wal_age}s;$w_limit;$c_limit ".
-        "num_archives=". scalar(@filelist_sorted);
+        sprintf("latest_archive_age=${latest_wal_age}%s;$w_limit;$c_limit ".
+        "num_archives=". scalar(@filelist_sorted), get_unit('s'));
 
     $timeline = hex(substr($filelist_sorted[-1][0], 0, 8));
     $wal = hex(substr($filelist_sorted[0][0], 8, 8));
@@ -1324,7 +1336,7 @@ sub check_autovacuum {
     $oldest = 'NaN' if not defined ( $oldest );
 
     @perfdata = map { "$_=$activity{$_}" } keys %activity;
-    push @perfdata, "oldest_autovacuum=$oldest" . "s";
+    push @perfdata, "oldest_autovacuum=$oldest" . get_unit("s");
     push @perfdata, "max_workers=$max_workers";
     push @msg, "Number of autovacuum: $numautovac";
     push @msg, "Oldest autovacuum: " . to_interval($oldest) if $oldest ne "NaN";
@@ -1663,7 +1675,7 @@ sub check_backends_status {
             if exists $warn{$s} and exists $crit{$s};
 
         push @perfdata => $perf;
-        push @perfdata => "'oldest $s'=$status{$s}[1]s"
+        push @perfdata => sprintf("'oldest $s'=$status{$s}[1]%s", get_unit('s'))
             if $hosts[0]->{'version_num'} >= $PG_VERSION_83
                 and $s !~ '^(?:disabled|undefined|insufficient)';
 
@@ -1746,7 +1758,7 @@ sub check_backup_label_age {
     $rs = @{ query_ver( $hosts[0], %queries )->[0] }[0];
 
     push @perfdata,
-         "age=${rs}s;$w_limit;$c_limit";
+         sprintf("age=${rs}%s;$w_limit;$c_limit", get_unit('s'));
 
     return critical( $me, [ "age: ".to_interval($rs) ], \@perfdata )
         if $rs > $c_limit;
@@ -1795,6 +1807,8 @@ sub check_bgwriter {
     my $now     = time();
     my %args    = %{ $_[0] };
     my $me      = 'POSTGRES_BGWRITER';
+    my $Nps;
+    my $Bps;
     my %queries = (
         $PG_VERSION_83 => q{SELECT checkpoints_timed, checkpoints_req,
               buffers_checkpoint * current_setting('block_size')::numeric,
@@ -1885,14 +1899,17 @@ sub check_bgwriter {
     $delta_maxwritten_clean  = ($rs[4] - $bgw{'maxwritten_clean'}) / $delta_ts;
     $delta_backend_fsync     = ($rs[7] - $bgw{'backend_fsync'})    / $delta_ts;
 
-    push @perfdata, "buffers_backend=${delta_buff_backend}Nps".
-                    " checkpoint_timed=${delta_checkpoint_timed}Nps".
-                    " checkpoint_req=${delta_checkpoint_req}Nps".
-                    " buffers_checkpoint=${delta_buff_checkpointer}Bps".
-                    " buffers_clean=${delta_buff_bgwriter}Bps".
-                    " maxwritten_clean=${delta_maxwritten_clean}Nps".
-                    " buffers_backend_fsync=${delta_backend_fsync}Nps".
-                    " buffers_alloc=${delta_buff_alloc}Bps";
+    $Nps = get_unit('Nps');
+    $Bps = get_unit('Bps');
+
+    push @perfdata, "buffers_backend=${delta_buff_backend}${Nps}".
+                    " checkpoint_timed=${delta_checkpoint_timed}${Nps}".
+                    " checkpoint_req=${delta_checkpoint_req}${Nps}".
+                    " buffers_checkpoint=${delta_buff_checkpointer}${Bps}".
+                    " buffers_clean=${delta_buff_bgwriter}${Bps}".
+                    " maxwritten_clean=${delta_maxwritten_clean}${Nps}".
+                    " buffers_backend_fsync=${delta_backend_fsync}${Nps}".
+                    " buffers_alloc=${delta_buff_alloc}${Bps}";
 
     if ($delta_buff_total) {
 
@@ -2443,9 +2460,9 @@ sub check_commit_ratio {
         $global_commits   += $commits;
         $global_rollbacks += $rollbacks;
 
-        push @perfdata, sprintf "'%s_commit_rate'=%.2ftps",   $db, $commit_rate;
-        push @perfdata, sprintf "'%s_rollback_rate'=%.2ftps", $db, $rollback_rate;
-        push @perfdata, sprintf "'%s_xact_rate'=%.2ftps",     $db, $xact_rate;
+        push @perfdata, sprintf "'%s_commit_rate'=%.2f%s",   $db, $commit_rate, get_unit('tps');
+        push @perfdata, sprintf "'%s_rollback_rate'=%.2f%s", $db, $rollback_rate, get_unit('tps');
+        push @perfdata, sprintf "'%s_xact_rate'=%.2f%s",     $db, $xact_rate, get_unit('tps');
 
         if ( $rollbacks == 0) {
             $ratio = 0;
@@ -2453,7 +2470,7 @@ sub check_commit_ratio {
             $ratio = $rollbacks * 100 / ($commits + $rollbacks);
         }
 
-        push @perfdata,  sprintf("'%s_rollback_ratio'=%.2f%%", $db, $ratio );
+        push @perfdata,  sprintf("'%s_rollback_ratio'=%.2f%s", $db, $ratio, get_unit('%') );
 
         THRESHOLD_LOOP: foreach my $val ( ('rollbacks', 'rollback_rate', 'rollback_ratio') ) {
             my $prefix = "${db}_${val}";
@@ -2818,7 +2835,7 @@ sub check_database_size {
         $c_limit = get_size( $args{'critical'}, $db->[1] );
         $delta = $db->[1] - $db_sizes{ $db->[0] };
 
-        push @perfdata => "$db->[0]=$db->[1]B;$w_limit;$c_limit";
+        push @perfdata => sprintf("$db->[0]=$db->[1]%s;$w_limit;$c_limit", get_unit('B'));
 
         if ( abs($delta) >= $c_limit ) {
             push @msg_crit => "$db->[0] ($delta, now: $db->[1])";
@@ -2924,18 +2941,18 @@ sub check_hit_ratio {
             $ratio = int($ratio*100+0.05)/100;
             $new_db_hitratio{ $db->[0] }[2] = $ratio;
 
-            $perfdata_value = sprintf "'%s'=%s%%", $db->[0], $ratio;
+            $perfdata_value = sprintf "'%s'=%s%s", $db->[0], $ratio, get_unit('%');
         }
         # no activity since last run, use previous hit ratio
         # this should not happen as the query itself hit/read.
         elsif ( $db->[1] + $db->[2] > 0 ) {
             $ratio = $db_hitratio{ $db->[0] }[2];
-            $perfdata_value = sprintf "'%s'=%s%%", $db->[0], $ratio;
+            $perfdata_value = sprintf "'%s'=%s%s", $db->[0], $ratio, get_unit('%');
         }
         # this database has no reported activity yet
         else {
             $new_db_hitratio{ $db->[0] }[2] = 'NaN';
-            $perfdata_value = sprintf "'%s'=NaN%%", $db->[0];
+            $perfdata_value = sprintf "'%s'=NaN%s", $db->[0], get_unit('%');
         }
 
         $perfdata_value .= ";$args{'warning'};$args{'critical'}"
@@ -2945,12 +2962,12 @@ sub check_hit_ratio {
 
         if ( defined $args{'critical'} ) {
             if ( $db->[1] < $args{'critical'} ) {
-                push @msg_crit => sprintf "%s: %s%%", $db->[0], $ratio;
+                push @msg_crit => sprintf "%s: %s%s", $db->[0], $ratio, get_unit('%');
                 next DB_LOOP;
             }
 
             if ( defined $args{'warning'} and $db->[1] < $args{'warning'} ) {
-                push @msg_warn => sprintf "%s: %s%%", $db->[0], $ratio;
+                push @msg_warn => sprintf "%s: %s%s", $db->[0], $ratio, get_unit('%');
             }
         }
     }
@@ -3089,9 +3106,9 @@ sub check_hot_standby_delta {
 
         push @perfdata => "'receive delta $host->{'name'}'=".
             ($host->{'receive_delta'} > 0 ? $host->{'receive_delta'}:0).
-            "B;$w_limit_received;$c_limit_received; 'replay delta $host->{'name'}'=".
+            get_unit('B') . ";$w_limit_received;$c_limit_received; 'replay delta $host->{'name'}'=".
             ($host->{'replay_delta'} > 0 ? $host->{'replay_delta'}:0) .
-            "B;$w_limit_replayed;$c_limit_replayed"
+            get_unit('B') . ";$w_limit_replayed;$c_limit_replayed"
         ;
 
         if ($host->{'receive_delta'} > $c_limit_received) {
@@ -3279,7 +3296,7 @@ sub check_is_replay_paused {
     ) if not $rs[0];
 
     push @perfdata, "is_paused=". $rs[1];
-    push @perfdata, "lag_time=". $rs[2] . "s";
+    push @perfdata, "lag_time=". $rs[2] . get_unit("s");
     push @perfdata, "has_data_delta=". $rs[3];
 
     # Always return ok if replay is not paused
@@ -3378,7 +3395,7 @@ LOOP_DB: foreach my $db (@all_db) {
         $rs = query_ver( $hosts[0], %queries, $db )->[0];
         $db =~ s/=//g;
 
-        $perfdata = "'$db'=$rs->[0]s;$w_limit;$c_limit";
+        $perfdata = sprintf("'$db'=$rs->[0]%s;$w_limit;$c_limit", get_unit('s'));
 
         if ($hosts[0]->{'version_num'} >= $PG_VERSION_91 ) {
             $new_counts{$db} = [$rs->[1], $rs->[2]];
@@ -3779,8 +3796,8 @@ sub check_longest_query {
         }
 
         push @perfdata, (
-            "'$db max'=$stats{$db}{'max'}s;$w_limit;$c_limit",
-            "'$db avg'=$stats{$db}{'avg'}s;$w_limit;$c_limit",
+            sprintf("'$db max'=$stats{$db}{'max'}%s;$w_limit;$c_limit", get_unit('s')),
+            sprintf("'$db avg'=$stats{$db}{'avg'}%s;$w_limit;$c_limit", get_unit('s')),
             "'$db #queries'=$stats{$db}{'num'}"
         );
 
@@ -4059,7 +4076,7 @@ sub check_minor_version {
         return unknown( $me, \@msg );
     }
 
-    push @perfdata => "version=". $hosts[0]{'version_num'} . "PGNUMVER";
+    push @perfdata => "version=". $hosts[0]{'version_num'} . get_unit("PGNUMVER");
 
     if ( $hosts[0]{'version_num'} != $latest_versions{$major_version}[0] ) {
         push @msg => "PostgreSQL version ". $hosts[0]{'version'}
@@ -4166,8 +4183,8 @@ sub check_oldest_2pc {
         }
 
         push @perfdata, (
-            "'$db max'=$stats{$db}{'max'}s;$w_limit;$c_limit",
-            "'$db avg'=$stats{$db}{'avg'}s;$w_limit;$c_limit",
+            sprintf("'$db max'=$stats{$db}{'max'}%s;$w_limit;$c_limit", get_unit('s')),
+            sprintf("'$db avg'=$stats{$db}{'avg'}%s;$w_limit;$c_limit", get_unit('s')),
             "'$db # prep. xact'=$stats{$db}{'num'}"
         );
 
@@ -4294,8 +4311,8 @@ sub check_oldest_idlexact {
         }
 
         push @perfdata, (
-            "'$db max'=$stats{$db}{'max'}s;$w_limit;$c_limit",
-            "'$db avg'=$stats{$db}{'avg'}s;$w_limit;$c_limit",
+            sprintf("'$db max'=$stats{$db}{'max'}%s;$w_limit;$c_limit", get_unit('s')),
+            sprintf("'$db avg'=$stats{$db}{'avg'}%s;$w_limit;$c_limit", get_unit('s')),
             "'$db # idle xact'=$stats{$db}{'num'}"
         );
 
@@ -4516,11 +4533,11 @@ sub check_pg_dump_backup {
         $last_age  = $now - $lasts{$db}[0];
         $first_age = $now - $firsts{$db}[0];
 
-        $perf_oldest = sprintf "'%s_oldest'=%ss", $db, $first_age;
-        $perf_newest = sprintf "'%s_newest'=%ss", $db, $last_age;
-        $perf_size   = sprintf "'%s_size'=%sB", $db, $lasts{$db}[1];
-        $perf_delta  = sprintf "'%s_delta'=%sB", $db,
-            $lasts{$db}[1] - $db_sizes{$db}[1];
+        $perf_oldest = sprintf "'%s_oldest'=%s%s", $db, $first_age, get_unit('s');
+        $perf_newest = sprintf "'%s_newest'=%s%s", $db, $last_age, get_unit('s');
+        $perf_size   = sprintf "'%s_size'=%s%s", $db, $lasts{$db}[1], get_unit('B');
+        $perf_delta  = sprintf "'%s_delta'=%s%s", $db,
+            $lasts{$db}[1] - $db_sizes{$db}[1], get_unit('B');
 
         if ( exists $warn{'newest'} or exists $crit{'newest'} ) {
             my $c_limit = $crit{'newest'};
@@ -4900,9 +4917,9 @@ sub check_streaming_delta {
         $name = "$host->[0]\@$host->[1]";
 
         push @perfdata => "'sent delta $name'=${send_delta}B ".
-            "'wrote delta $name'=${write_delta}B ".
-            "'flushed delta $name'=${flush_delta}B ".
-            "'replay delta $name'=${replay_delta}B ".
+            sprintf("'wrote delta $name'=${write_delta}%s ", get_unit('B')).
+            sprintf("'flushed delta $name'=${flush_delta}%s ", get_unit('B')).
+            sprintf("'replay delta $name'=${replay_delta}%s ", get_unit('B')).
             "'pid $name'=$host->[2]";
 
         $num_clusters++;
@@ -5464,8 +5481,8 @@ DB_LOOP: foreach my $stat (@rs) {
         my $diff_size;
 
         if ( $stat->[0] eq 'live' ) {
-            push @perfdata => "'# files in $stat->[1]'=$stat->[2]File${perf_flimits}";
-            push @perfdata => "'Total size in $stat->[1]'=$stat->[3]B${perf_limits}";
+            push @perfdata => sprintf("'# files in $stat->[1]'=$stat->[2]%s${perf_flimits}", get_unit('File'));
+            push @perfdata => sprintf("'Total size in $stat->[1]'=$stat->[3]%s${perf_limits}", get_unit('B'));
 
             if ( defined $c_limit) {
                 if ( $stat->[3] > $c_limit ) {
@@ -5508,10 +5525,10 @@ DB_LOOP: foreach my $stat (@rs) {
         $frate = 60 * $diff_number / ($now - $last_check);
         $brate = 60 * $diff_size   / ($now - $last_check);
 
-        push @perfdata => "'$stat->[1]'=${frate}Fpm";
-        push @perfdata => "'$stat->[1]'=${brate}Bpm";
-        push @perfdata => "'$stat->[1]'=${diff_number}Files${perf_flimits}";
-        push @perfdata => "'$stat->[1]'=${diff_size}B${perf_limits}";
+        push @perfdata => sprintf("'Files per min in $stat->[1]'=${frate}%s", get_unit('Fpm'));
+        push @perfdata => sprintf("'Bytes per min in $stat->[1]'=${brate}%s", get_unit('Bpm'));
+        push @perfdata => sprintf("'# files in $stat->[1]'=${diff_number}%s${perf_flimits}", get_unit('Files'));
+        push @perfdata => sprintf("'Total size in $stat->[1]'=${diff_size}%s${perf_limits}", get_unit('B'));
 
         if ( defined $c_limit) {
             if ( $diff_size > $c_limit ) {
@@ -5736,7 +5753,7 @@ sub check_wal_files {
             my $rate = ($curr_lsn - $prev_lsn[1])/($now - $prev_lsn[0]);
             $rate = int($rate*100+0.5)/100;
 
-            push @perfdata => "wal_rate=${rate}Bps";
+            push @perfdata => sprintf("wal_rate=${rate}%s", get_unit('Bps'));
         }
 
         save $hosts[0], 'last wal files LSN', [ $now, $curr_lsn ], $args{'status-file'};
@@ -5781,6 +5798,7 @@ GetOptions(
         'query=s',
         'type=s',
         'reverse!',
+        'strict!',
         'work_mem=i',
         'maintenance_work_mem=i',
         'shared_buffers=i',
