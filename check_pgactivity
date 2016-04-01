@@ -10,7 +10,7 @@ check_pgactivity - PostgreSQL plugin for Nagios
 
 =head2 SYNOPSIS
 
-  check_pgactivity {-w|--warning THRESHOLD} {-c|--critical THRESHOLD} [-s|--service SERVICE ] [-h|--host HOST] [-U|--username ROLE] [-p|--port PORT] [-d|--dbname DATABASE] [-S|--dbservice SERVICE_NAME] [-P|--psql PATH] [--debug] [--status-file FILE] [--path PATH] [-t|--timemout TIMEOUT]
+  check_pgactivity {-w|--warning THRESHOLD} {-c|--critical THRESHOLD} [-s|--service SERVICE ] [-h|--host HOST] [-U|--username ROLE] [-p|--port PORT] [-d|--dbname DATABASE] [-S|--dbservice SERVICE_NAME] [-P|--psql PATH] [--debug] [--status-file FILE] [--path PATH] [-t|--timemout TIMEOUT] [--strict]
   check_pgactivity [-l|--list]
   check_pgactivity [--help]
 
@@ -317,6 +317,10 @@ Print version and exit.
 =item B<--debug>
 
 Print some debug messages.
+
+=item B<--strict>
+
+Only use legacy units
 
 =item B<-?>, B<--help>
 
