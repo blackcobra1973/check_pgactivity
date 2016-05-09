@@ -103,6 +103,10 @@ my %services = (
         'sub'  => \&check_database_size,
         'desc' => 'Variation of database sizes.',
     },
+    'table_unlogged' => {
+        'sub'  => \&check_table_unlogged,
+        'desc' => 'Check unlogged table'
+    },
     'wal_files' => {
         'sub'  => \&check_wal_files,
         'desc' => 'Total number of WAL files.',
