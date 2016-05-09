@@ -236,6 +236,10 @@ Database server host or socket directory (default: "localhost").
 
 Database user name (default: "postgres").
 
+=item B<--password> PASSWORD
+
+Database password (default: "$PGPASSWORD").
+
 =item B<-p>, B<--port> PORT
 
 Database server port (default: "5432").
@@ -330,6 +334,7 @@ my %args = (
     'service'               => undef,
     'host'                  => undef,
     'username'              => undef,
+    'password'              => undef,
     'port'                  => undef,
     'dbname'                => undef,
     'dbservice'             => undef,
@@ -697,7 +702,7 @@ sub get_size($;$) {
 =head2 CONNECTIONS
 
 check_pgactivity allows two different connection specifications: by service, or
-by specifying values for host, user, port, and database. 
+by specifying values for host, user, port, and database.
 Some services can run on multiple hosts, or needs to connect to multiple hosts.
 
 You must specify one of the parameters below if the service needs to connect
@@ -772,6 +777,7 @@ sub parse_hosts(\%) {
     # Any missing parameters will be set to its default value.
     if (defined $args{'host'}
         or defined $args{'username'}
+        or defined $args{'password'}
         or defined $args{'port'}
         or defined $args{'dbname'}
     ) {
@@ -779,6 +785,8 @@ sub parse_hosts(\%) {
             unless defined $args{'host'};
         $args{'username'} = $ENV{'PGUSER'} || 'postgres'
             unless defined $args{'username'};
+        $args{'password'} = $ENV{'PGPASSWORD'}
+            unless defined $args{'password'};
         $args{'port'} = $ENV{'PGPORT'} || '5432'
             unless defined $args{'port'};
         $args{'dbname'} = $ENV{'PGDATABASE'} || 'template1'
@@ -787,8 +795,9 @@ sub parse_hosts(\%) {
         my @dbhosts = split( /,/, $args{'host'} );
         my @dbnames = split( /,/, $args{'dbname'} );
         my @dbusers = split( /,/, $args{'username'} );
+        my @dbpwds = split( /,/, $args{'password'} );
         my @dbports = split( /,/, $args{'port'} );
-        my $nbhosts = max $#dbhosts, $#dbnames, $#dbusers, $#dbports;
+        my $nbhosts = max $#dbhosts, $#dbnames, $#dbusers, $#dbpwds, $#dbports;
 
         # Take the first value for each connection properties as default.
         # eg. "-h localhost -p 5432,5433" gives two hosts:
@@ -801,6 +810,7 @@ sub parse_hosts(\%) {
                     'port'      => $dbports[$i] || $dbports[0],
                     'db'        => $dbnames[$i] || $dbnames[0],
                     'user'      => $dbusers[$i] || $dbusers[0],
+                    'password'  => $dbpwds[$i] || $dbpwds[0],
                     'pgversion' => undef
                 }
             );
@@ -847,6 +857,7 @@ sub query($$;$) {
     delete $ENV{PGHOST};
     delete $ENV{PGPORT};
     delete $ENV{PGUSER};
+    delete $ENV{PGPASSWORD};
     delete $ENV{PGOPTIONS};
 
     $ENV{PGDATABASE} = $host->{'db'}        if defined $host->{'db'};
@@ -854,14 +865,16 @@ sub query($$;$) {
     $ENV{PGHOST}     = $host->{'host'}      if defined $host->{'host'};
     $ENV{PGPORT}     = $host->{'port'}      if defined $host->{'port'};
     $ENV{PGUSER}     = $host->{'user'}      if defined $host->{'user'};
+    $ENV{PGPASSWORD} = $host->{'password'}  if defined $host->{'password'};
     $ENV{PGOPTIONS}  = '-c client_encoding=utf8 -c client_min_messages=error -c statement_timeout=' . get_time($args{'timeout'}) * 1000;
 
     dprint ("Query: $query\n");
-    dprint ("Env. service: $ENV{PGSERVICE} \n") if defined $host->{'dbservice'};
-    dprint ("Env. host   : $ENV{PGHOST}    \n") if defined $host->{'host'};
-    dprint ("Env. port   : $ENV{PGPORT}    \n") if defined $host->{'port'};
-    dprint ("Env. user   : $ENV{PGUSER}    \n") if defined $host->{'user'};
-    dprint ("Env. db     : $ENV{PGDATABASE}\n") if defined $host->{'db'};
+    dprint ("Env. service: $ENV{PGSERVICE}      \n") if defined $host->{'dbservice'};
+    dprint ("Env. host   : $ENV{PGHOST}         \n") if defined $host->{'host'};
+    dprint ("Env. port   : $ENV{PGPORT}         \n") if defined $host->{'port'};
+    dprint ("Env. user   : $ENV{PGUSER}         \n") if defined $host->{'user'};
+    dprint ("Env. passwd : $ENV{PGPASSWORD}     \n") if defined $host->{'password'};
+    dprint ("Env. db     : $ENV{PGDATABASE}     \n") if defined $host->{'db'};
 
     $tmpfile = File::Temp->new(
         TEMPLATE => 'check_pga-XXXXXXXX',
@@ -5328,7 +5341,7 @@ sub check_temp_files {
               WHEN agg.tmpfile <> '' THEN (pg_stat_file(agg.dir||'/'||agg.tmpfile)).size
               ELSE 0 END)
           FROM (
-            SELECT t3.datname, t3.spcname, t3.dbroot||'/'||t3.dbcont AS dir, 
+            SELECT t3.datname, t3.spcname, t3.dbroot||'/'||t3.dbcont AS dir,
               CASE gs.i WHEN 1 THEN pg_ls_dir(t3.dbroot||'/'||t3.dbcont) ELSE '' END AS tmpfile
             FROM (
               SELECT d.datname, t2.spcname, t2.tblroot||'/'||t2.tblcont AS dbroot, pg_ls_dir(t2.tblroot||'/'||t2.tblcont) AS dbcont
@@ -5637,7 +5650,7 @@ sub check_wal_files {
           SELECT setting::int + current_setting('wal_keep_segments')::int as max_nb_wal
           FROM pg_settings
           WHERE name = 'max_wal_size'
-        )       
+        )
         SELECT s.f,
           max_nb_wal,
           CASE WHEN pg_is_in_recovery()
@@ -5809,6 +5822,7 @@ GetOptions(
         'service|s=s',
         'host|h=s',
         'username|U=s',
+        'password=s',
         'port|p=s',
         'dbname|d=s',
         'dbservice|S=s',
