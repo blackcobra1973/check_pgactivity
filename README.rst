@@ -49,6 +49,12 @@ offers many options to measure and monitor useful performance metrics.
 
 
 
+\ **--password**\  PASSWORD
+
+ Database password (default: "").
+
+
+
 \ **-p**\ , \ **--port**\  PORT
 
  Database server port (default: "5432").
