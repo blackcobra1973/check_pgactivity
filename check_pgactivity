@@ -5064,7 +5064,7 @@ sub check_table_unlogged {
     pod2usage(
         -message => 'FATAL: you must give only one host with service "table_unlogged"".',
         -exitval => 127
-    '"') if @hosts != 1;
+    ) if @hosts != 1;
 
     @all_db = @{ get_all_dbname( $hosts[0] ) };
 
