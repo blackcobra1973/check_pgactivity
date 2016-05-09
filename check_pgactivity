@@ -238,7 +238,7 @@ Database user name (default: "postgres").
 
 =item B<--password> PASSWORD
 
-Database password (default: "$PGPASSWORD").
+Database password (default: "").
 
 =item B<-p>, B<--port> PORT
 
@@ -785,7 +785,7 @@ sub parse_hosts(\%) {
             unless defined $args{'host'};
         $args{'username'} = $ENV{'PGUSER'} || 'postgres'
             unless defined $args{'username'};
-        $args{'password'} = $ENV{'PGPASSWORD'}
+        $args{'password'} = $ENV{'PGPASSWORD'} || ''
             unless defined $args{'password'};
         $args{'port'} = $ENV{'PGPORT'} || '5432'
             unless defined $args{'port'};
