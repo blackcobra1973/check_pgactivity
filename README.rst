@@ -52,9 +52,11 @@ offers many options to measure and monitor useful performance metrics.
 \ **--password**\  PASSWORD
 
  Database password (default: "").
+
  You have now multiple options: Supply password, empty password (not tested),
- use \ ``$PGPASSWORD``\ environment variable or use the .pg_service.conf file.
- For the .pg_service.conf do not forget to use the \ ``-S``\ or \ ``--dbservice``\ option.
+ use \ ``$PGPASSWORD``\ environment variable or use the \ ``.pg_service.conf``\ file.
+
+ For the \ ``.pg_service.conf``\ do not forget to use the \ ``-S``\ or \ ``--dbservice``\ option.
 
 
 
