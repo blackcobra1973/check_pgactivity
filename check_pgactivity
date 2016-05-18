@@ -301,8 +301,8 @@ Path to the C<psql> executable (default: "psql").
 =item B<--status-file> PATH
 
 PATH to the file where service status information will be kept between
-successive calls. Default is to save check_pgactivity.data in the same
-directory as the script.
+successive calls. Default is to save check_pgactivity.data in the /tmp
+directory.
 
 =item B<--dump-status-file>
 
@@ -350,7 +350,7 @@ my %args = (
     'tmpdir'                => File::Spec->tmpdir(),
     'psql'                  => undef,
     'path'                  => undef,
-    'status-file'           => dirname(__FILE__) . '/check_pgactivity.data',
+    'status-file'           => dirname(__FILE__) . '/tmp/check_pgactivity.data',
     'query'                 => undef,
     'type'                  => undef,
     'reverse'               => 0,
