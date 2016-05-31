@@ -47,6 +47,9 @@ push @path => $FindBin::Bin;
 $ENV{'PATH'} = join $Config{'path_sep'} => @path;
 undef @path;
 
+$ENV{'PGBINDIR'} = "/opt/PostgreSQL/9.5/bin";
+#use Env::Sourced qw(~/postgres/pg_env.sh);
+
 # force the env in english
 setlocale( LC_ALL, 'C' );
 
