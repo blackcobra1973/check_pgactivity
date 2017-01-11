@@ -51,11 +51,15 @@ $ENV{'PGBINDIR'} = "/opt/PostgreSQL/9.5/bin";
 #use Env::Sourced qw(~/postgres/pg_env.sh);
 
 # force the env in english
+delete $ENV{'LC_ALL'};
+$ENV{'LC_ALL'} = 'C';
 setlocale( LC_ALL, 'C' );
+delete $ENV{'LANG'};
+delete $ENV{'LANGUAGE'};
 
 $| = 1;
 
-$VERSION = '1.26dev';
+$VERSION = '2.1_rc3';
 $PROGRAM = 'check_pgactivity';
 
 my $PG_VERSION_MIN = 70400;
@@ -71,6 +75,10 @@ my $PG_VERSION_92  = 90200;
 my $PG_VERSION_93  = 90300;
 my $PG_VERSION_94  = 90400;
 my $PG_VERSION_95  = 90500;
+my $PG_VERSION_96  = 90600;
+
+# reference to the output sub
+my $output_fmt;
 
 # Available services and descriptions.
 #
@@ -114,9 +122,9 @@ my %services = (
         'sub'  => \&check_wal_files,
         'desc' => 'Total number of WAL files.',
     },
-    'ready_archives' => {
-        'sub'  => \&check_ready_archives,
-        'desc' => 'Check the number of wal files ready to archive.',
+    'archiver' => {
+        'sub'  => \&check_archiver,
+        'desc' => 'Check the archiver status and number of wal files ready to archive.',
     },
     'last_vacuum' => {
         'sub'  => \&check_last_vacuum,
@@ -164,6 +172,10 @@ my %services = (
         'sub'  => \&check_streaming_delta,
         'desc' => 'Check delta in bytes between a master and its standbys in streaming replication.',
     },
+    'settings' => {
+        'sub'  => \&check_settings,
+        'desc' => 'Check if the configuration file changed.',
+    },
     'hit_ratio' => {
         'sub'  => \&check_hit_ratio,
         'desc' => 'Check hit ratio on databases.'
@@ -191,6 +203,10 @@ my %services = (
     'max_freeze_age' => {
         'sub'  => \&check_max_freeze_age,
         'desc' => 'Check oldest database in transaction age.'
+    },
+        'invalid_indexes' => {
+        'sub'  => \&check_invalid_indexes,
+        'desc' => 'Check for invalid indexes.'
     },
     'is_master' => {
         'sub'  => \&check_is_master,
@@ -253,7 +269,7 @@ Database server port (default: "5432").
 
 =item B<-d>, B<--dbname> DATABASE
 
-Database name to connect to (default: "postgres").
+Database name to connect to (default: "template1").
 
 B<WARNING>! This is not necessarily one of the database that will be
 checked. See C<--dbinclude> and C<--dbexclude> .
@@ -292,6 +308,19 @@ The Warning threshold.
 
 The Critical threshold.
 
+=item B<-F>, B<--format> OUTPUT_FORMAT
+
+The output format. Supported output are: C<binary>, C<debug>, C<human>,
+C<nagios> and C<nagios_strict>.
+
+Using the C<binary> format, the results are written in a binary file (using perl
+module C<Storable>) given in argument C<--output>. If no output is given,
+defaults to file C<check_pgactivity.out> in the same directory as the script.
+
+The C<nagios_strict> format is equivalent to the C<nagios> format. The only
+difference is that it enforces the unit follow the strict nagios specs: B, c, s
+or %. Any unit not beeing in this list is dropped (Bps, Tps, etc).
+
 =item B<--tmpdir> DIRECTORY
 
 Path to a directory where the script can create temporary files. The
@@ -310,6 +339,12 @@ directory.
 =item B<--dump-status-file>
 
 Dump the content of the status file and exit. This is useful for debug purpose.
+
+=item B<--dump-bin-file> [PATH]
+
+Dump the content of the given binary file previously created using
+C<--format binary>. If no path is given, defaults to file
+C<check_pgactivity.out> in the same directory as the script.
 
 =item B<-t>, B<--timeout> TIMEOUT
 
@@ -354,6 +389,7 @@ my %args = (
     'psql'                  => undef,
     'path'                  => undef,
     'status-file'           => '/tmp/check_pgactivity.data',
+    'output'                => '/tmp/check_pgactivity.out',
     'query'                 => undef,
     'type'                  => undef,
     'reverse'               => 0,
@@ -368,13 +404,16 @@ my %args = (
     'no_check_enable'       => 0,
     'no_check_track_counts' => 0,
     'ignore-wal-size'       => 0,
+    'save'                  => 0,
     'suffix'                => '',
     'slave'                 => [],
     'list'                  => 0,
     'help'                  => 0,
     'debug'                 => 0,
     'timeout'               => '30s',
-    'dump-status-file'      => 0
+    'dump-status-file'      => 0,
+    'dump-bin-file'         => undef,
+    'format'                => 'nagios'
 );
 
 # Set name of the program without path*
@@ -503,13 +542,16 @@ sub load($$$) {
     return $all->{$hostkey}{$name};
 }
 
-sub dump_status_file() {
-    my $all = lock_retrieve($args{'status-file'});
+sub dump_status_file {
+    my $f = shift;
+    my $all;
 
-    {
-        local $Data::Dumper::Terse = 1;
-        print Dumper($all);
-    }
+    $f = $args{'status-file'} unless defined $f;
+    $f = $args{'output'} unless $f ;
+
+    $all = lock_retrieve($f);
+
+    print Data::Dumper->new( [ $all ] )->Terse(1)->Dump;
 
     exit 0;
 }
@@ -568,6 +610,8 @@ sub to_interval($) {
     }
 
     $interval .= "${val}s" if $val > 0;
+
+    return "${val}s" unless $interval; # return a value if $val <= 0
 
     return $interval;
 }
@@ -840,12 +884,13 @@ sub parse_hosts(\%) {
 #   * host
 #   * query
 #   * (optional) database
+#   * (optional) get_fields
 # The result is an array of array:
 #   [
 #     [column1, ...] # line1
 #     ...
 #   ]
-sub query($$;$) {
+sub query($$;$$) {
     my $host  = shift;
     my $query = shift;
     my $db    = shift;
@@ -853,6 +898,7 @@ sub query($$;$) {
     my $res   = '';
     my $RS    = chr(30); # ASCII RS  (record separator)
     my $FS    = chr(3);  # ASCII ETX (end of text)
+    my $get_fields = shift;
     my $tmpfile;
     my $psqlcmd;
     my $rc;
@@ -891,8 +937,9 @@ sub query($$;$) {
     print $tmpfile "$query;" or die "Could not create or write in a temp file!";
 
     $psqlcmd  = qq{ $args{'psql'} --set "ON_ERROR_STOP=1" }
-              . qq{ -qXAtf $tmpfile -R $RS -F $FS };
+              . qq{ -qXAf $tmpfile -R $RS -F $FS };
     $psqlcmd .= qq{ --dbname='$db' } if defined $db;
+    $psqlcmd .= qq{ -t } unless defined $get_fields;
     $res      = qx{ $psqlcmd 2>&1 };
     $rc       = $?;
 
@@ -909,6 +956,8 @@ sub query($$;$) {
 
         push @res, [ split(chr(3) => $_, -1) ]
             foreach split (chr(30) => $res, -1);
+
+        pop @res if defined $get_fields and $res[-1][0] =~ m/^\(\d+ rows?\)$/;
     }
 
     dprint( "Query result: ". Dumper( \@res ) );
@@ -1032,25 +1081,140 @@ sub dprint {
 }
 
 sub unknown($;$$$) {
-    return output( 3, $_[0], $_[1], $_[2], $_[3] );
+    return $output_fmt->( 3, $_[0], $_[1], $_[2], $_[3] );
 }
 
 sub critical($;$$$) {
-    return output( 2, $_[0], $_[1], $_[2], $_[3] );
+    return $output_fmt->( 2, $_[0], $_[1], $_[2], $_[3] );
 }
 
 sub warning($;$$$) {
-    return output( 1, $_[0], $_[1], $_[2], $_[3] );
+    return $output_fmt->( 1, $_[0], $_[1], $_[2], $_[3] );
 }
 
 sub ok($;$$$) {
-    return output( 0, $_[0], $_[1], $_[2], $_[3] );
+    return $output_fmt->( 0, $_[0], $_[1], $_[2], $_[3] );
 }
 
-sub output ($$;$$$) {
+sub bin_output ($$;$$$) {
+    my $rc      = shift;
+    my $service = shift;
+    my $all = {};
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    $all = lock_retrieve( $args{'output'} ) if -r $args{'output'};
+
+    $all->{ $args{'service'} } = {
+        'timestamp' => time,
+        'rc'        => $rc,
+        'service'   => $service,
+        'messages'  => \@msg,
+        'perfdata'  => \@perfdata,
+        'longmsg'   => \@longmsg
+    };
+
+    lock_store( $all, $args{'output'} )
+        or die "Can't store data in '$args{'output'}'!\n";
+}
+
+sub debug_output ($$;$$$) {
+    my $rc      = shift;
+    my $service = shift;
+    my $ret;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    $ret  = sprintf "%-15s: %s\n", 'Service', $service;
+
+    $ret .= sprintf "%-15s: 0 (%s)\n", "Returns", "OK"       if $rc == 0;
+    $ret .= sprintf "%-15s: 1 (%s)\n", "Returns", "WARNING"  if $rc == 1;
+    $ret .= sprintf "%-15s: 2 (%s)\n", "Returns", "CRITICAL" if $rc == 2;
+    $ret .= sprintf "%-15s: 3 (%s)\n", "Returns", "UNKNOWN"  if $rc == 3;
+
+    $ret .= sprintf "%-15s: %s\n", "Message", $_ foreach @msg;
+    $ret .= sprintf "%-15s: %s\n", "Long message", $_ foreach @longmsg;
+    $ret .= sprintf "%-15s: %s\n", "Perfdata",
+        Data::Dumper->new([ $_ ])->Indent(0)->Terse(1)->Dump foreach @perfdata;
+
+    print $ret;
+
+    return $rc;
+}
+
+sub human_output ($$;$$$) {
+    my $rc      = shift;
+    my $service = shift;
+    my $ret;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    $ret  = sprintf "%-15s: %s\n", 'Service', $service;
+
+    $ret .= sprintf "%-15s: 0 (%s)\n", "Returns", "OK"       if $rc == 0;
+    $ret .= sprintf "%-15s: 1 (%s)\n", "Returns", "WARNING"  if $rc == 1;
+    $ret .= sprintf "%-15s: 2 (%s)\n", "Returns", "CRITICAL" if $rc == 2;
+    $ret .= sprintf "%-15s: 3 (%s)\n", "Returns", "UNKNOWN"  if $rc == 3;
+
+    $ret .= sprintf "%-15s: %s\n", "Message", $_ foreach @msg;
+    $ret .= sprintf "%-15s: %s\n", "Long message", $_ foreach @longmsg;
+
+    foreach my $perfdata ( @perfdata ) {
+        map {$_ = undef unless defined $_} @{$perfdata}[2..6];
+
+        if ( defined $$perfdata[2] and $$perfdata[2] =~ /B$/ ) {
+            $ret .= sprintf "%-15s: %s=%s", "Perfdata",
+                $$perfdata[0], to_size($$perfdata[1]);
+            $ret .= sprintf " warn=%s", to_size( $$perfdata[3] ) if defined $$perfdata[3];
+            $ret .= sprintf " crit=%s", to_size( $$perfdata[4] ) if defined $$perfdata[4];
+            $ret .= sprintf " min=%s", to_size( $$perfdata[5] ) if defined $$perfdata[5];
+            $ret .= sprintf " max=%s", to_size( $$perfdata[6] ) if defined $$perfdata[6];
+            $ret .= "\n";
+        }
+        elsif ( defined $$perfdata[2] and $$perfdata[2] =~ /s$/ ) {
+            $ret .= sprintf "%-15s: %s=%s", "Perfdata",
+                $$perfdata[0], to_interval( $$perfdata[1] );
+            $ret .= sprintf " warn=%s", to_interval( $$perfdata[3] ) if defined $$perfdata[3];
+            $ret .= sprintf " crit=%s", to_interval( $$perfdata[4] ) if defined $$perfdata[4];
+            $ret .= sprintf " min=%s", to_interval( $$perfdata[5] ) if defined $$perfdata[5];
+            $ret .= sprintf " max=%s", to_interval( $$perfdata[6] ) if defined $$perfdata[6];
+            $ret .= "\n";
+        }
+        else {
+            $ret .= sprintf "%-15s: %s=%s", "Perfdata",
+                $$perfdata[0], $$perfdata[1];
+            $ret .= sprintf "%s", $$perfdata[2] if defined $$perfdata[2];
+            $ret .= sprintf " warn=%s", $$perfdata[3] if defined $$perfdata[3];
+            $ret .= sprintf " crit=%s", $$perfdata[4] if defined $$perfdata[4];
+            $ret .= sprintf " min=%s", $$perfdata[5] if defined $$perfdata[5];
+            $ret .= sprintf " max=%s", $$perfdata[6] if defined $$perfdata[6];
+            $ret .= "\n";
+        }
+    }
+
+    print $ret;
+
+    return $rc;
+}
+
+sub nagios_output ($$;$$$) {
     my $rc  = shift;
     my $ret = shift;
-    my $state;
     my @msg;
     my @perfdata;
     my @longmsg;
@@ -1065,12 +1229,48 @@ sub output ($$;$$$) {
     @longmsg  = @{ $_[2] } if defined $_[2];
 
     $ret .= ": ".  join( ', ', @msg )     if @msg;
-    $ret .= " | ". join( ' ', @perfdata ) if @perfdata;
+    if ( scalar @perfdata ) {
+        $ret .= " |";
+        foreach my $perf ( @perfdata ) {
+            # escape quotes
+            $$perf[0] =~ s/'/''/g;
+            # surounding quotes if space in the label
+            $$perf[0] = "'$$perf[0]'" if $$perf[0] =~ /\s/;
+            # the perfdata itself and its unit
+            $ret .= " $$perf[0]=$$perf[1]";
+
+            # init and join optional values (unit/warn/crit/min/max)
+            map {$_ = "" unless defined $_} @{$perf}[2..6];
+            $ret .= join ';' => @$perf[2..6];
+
+            # remove useless semi-colons at end
+            $ret =~ s/;*$//;
+        }
+    }
     $ret .= "\n". join( ' ', @longmsg ) if @longmsg;
 
     print $ret;
 
     return $rc;
+}
+
+sub nagios_strict_output ($$;$$$) {
+
+    my $rc  = shift;
+    my $ret = shift;
+    my @msg;
+    my @perfdata;
+    my @longmsg;
+
+    @msg      = @{ $_[0] } if defined $_[0];
+    @perfdata = @{ $_[1] } if defined $_[1];
+    @longmsg  = @{ $_[2] } if defined $_[2];
+
+    map { $$_[2] = '' if exists $$_[2] and defined $$_[2]
+                and $$_[2] !~ /\A[Bcs%]\z/
+    } @perfdata;
+
+    return nagios_output( $rc, $ret, \@msg, \@perfdata, \@longmsg );
 }
 
 =head2 SERVICES
@@ -1207,9 +1407,10 @@ sub check_archive_folder {
     # than the previous one (or at least the 9.2 one).
     $seg_per_wal++ if $wal_version >= $wal_versions{'93'};
 
-    push @perfdata,
-        "latest_archive_age=${latest_wal_age}s;$w_limit;$c_limit ".
-        "num_archives=". scalar(@filelist_sorted);
+    push @perfdata, [
+        'latest_archive_age', $latest_wal_age, 's', $w_limit, $c_limit
+    ];
+    push @perfdata, [ 'num_archives', scalar(@filelist_sorted) ];
 
     $start_tl = substr($filelist_sorted[0][0], 0, 8);
     $end_tl   = substr($filelist_sorted[-1][0], 0, 8);
@@ -1374,9 +1575,9 @@ sub check_autovacuum {
 
     $oldest = 'NaN' if not defined ( $oldest );
 
-    @perfdata = map { "$_=$activity{$_}" } keys %activity;
-    push @perfdata, "oldest_autovacuum=$oldest" . "s";
-    push @perfdata, "max_workers=$max_workers";
+    @perfdata = map { [ $_, $activity{$_}  ] } keys %activity;
+    push @perfdata, [ 'oldest_autovacuum', $oldest, 's' ];
+    push @perfdata, [ 'max_workers', $max_workers ];
     push @msg, "Number of autovacuum: $numautovac";
     push @msg, "Oldest autovacuum: " . to_interval($oldest) if $oldest ne "NaN";
 
@@ -1485,12 +1686,14 @@ sub check_backends {
 
     LOOP_DB: foreach my $db (@rs) {
         $num_backends += $db->[1];
-        push @perfdata,
-            "$db->[0]=$db->[1];$args{'warning'};$args{'critical'};0;$db->[2]";
+        push @perfdata, [
+            $db->[0], $db->[1], '', $args{'warning'}, $args{'critical'}, 0, $db->[2]
+        ];
     }
 
-    push @perfdata,
-            "maximum_connections=$rs[0][2];$args{'warning'};$args{'critical'};0;$rs[0][2]";
+    push @perfdata, [
+        'maximum_connections', $rs[0][2], undef, undef, undef, 0, $rs[0][2]
+    ];
 
     push @msg => "$num_backends connections on $rs[0][2]";
 
@@ -1651,6 +1854,22 @@ sub check_backends_status {
             FROM pg_stat_activity AS s
               JOIN pg_database d ON d.oid=s.datid
             WHERE d.datallowconn
+        },
+        # pg_stat_activity schema change for wait events
+        $PG_VERSION_96 => q{
+            SELECT CASE
+                WHEN s.wait_event = 'Lock' THEN 'waiting for lock'
+                WHEN s.query = '<insufficient privilege>'
+                    THEN 'insufficient privilege'
+                WHEN s.state IS NULL THEN 'undefined'
+                ELSE s.state
+              END,
+              extract('epoch' FROM
+                date_trunc('milliseconds', current_timestamp-s.xact_start)
+              ), s.query, current_setting('max_connections')
+            FROM pg_stat_activity AS s
+              JOIN pg_database d ON d.oid=s.datid
+            WHERE d.datallowconn
         }
     );
 
@@ -1709,12 +1928,12 @@ sub check_backends_status {
     }
 
     STATUS_LOOP: foreach my $s (sort keys %status) {
-        my $perf = "'$s'=$status{$s}[0]";
-        $perf .= ";$warn{$s};$crit{$s};0;$max_connections"
+        my @perf = ( $s, $status{$s}[0] );
+        push @perf, ( $warn{$s}, $crit{$s}, 0, $max_connections )
             if exists $warn{$s} and exists $crit{$s};
+        push @perfdata => [ @perf ];
 
-        push @perfdata => $perf;
-        push @perfdata => "'oldest $s'=$status{$s}[1]s"
+        push @perfdata => [ "oldest $s", $status{$s}[1], 's' ]
             if $hosts[0]->{'version_num'} >= $PG_VERSION_83
                 and $s !~ '^(?:disabled|undefined|insufficient)';
 
@@ -1796,8 +2015,7 @@ sub check_backup_label_age {
 
     $rs = @{ query_ver( $hosts[0], %queries )->[0] }[0];
 
-    push @perfdata,
-         "age=${rs}s;$w_limit;$c_limit";
+    push @perfdata, [ 'age', $rs, 's', $w_limit, $c_limit ];
 
     return critical( $me, [ "age: ".to_interval($rs) ], \@perfdata )
         if $rs > $c_limit;
@@ -1936,14 +2154,15 @@ sub check_bgwriter {
     $delta_maxwritten_clean  = ($rs[4] - $bgw{'maxwritten_clean'}) / $delta_ts;
     $delta_backend_fsync     = ($rs[7] - $bgw{'backend_fsync'})    / $delta_ts;
 
-    push @perfdata, "buffers_backend=${delta_buff_backend}Nps".
-                    " checkpoint_timed=${delta_checkpoint_timed}Nps".
-                    " checkpoint_req=${delta_checkpoint_req}Nps".
-                    " buffers_checkpoint=${delta_buff_checkpointer}Bps".
-                    " buffers_clean=${delta_buff_bgwriter}Bps".
-                    " maxwritten_clean=${delta_maxwritten_clean}Nps".
-                    " buffers_backend_fsync=${delta_backend_fsync}Nps".
-                    " buffers_alloc=${delta_buff_alloc}Bps";
+    push @perfdata, (
+        [ 'buffers_backend', $delta_buff_backend, 'Bps' ],
+        [ 'checkpoint_timed', $delta_checkpoint_timed, 'Nps' ],
+        [ 'checkpoint_req', $delta_checkpoint_req, 'Nps' ],
+        [ 'buffers_checkpoint', $delta_buff_checkpointer, 'Bps' ],
+        [ 'buffers_clean', $delta_buff_bgwriter, 'Bps' ],
+        [ 'maxwritten_clean', $delta_maxwritten_clean, 'Nps' ],
+        [ 'buffers_backend_fsync', $delta_backend_fsync, 'Nps' ],
+        [ 'buffers_alloc', $delta_buff_alloc, 'Bps' ] );
 
     if ($delta_buff_total) {
 
@@ -2375,11 +2594,7 @@ sub check_btree_bloat {
 
         $total_index += $nb_ind;
 
-        # Construct perfdata
-        my $perf = sprintf "'idx bloated in %s'=%s",
-                $db, $idx_bloated;
-
-        push @perfdata => $perf;
+        push @perfdata => [ "idx bloated in $db", $idx_bloated ];
     }
 
     # we use the warning count for the **total** number of bloated index
@@ -2423,12 +2638,11 @@ sub check_commit_ratio {
     my %new_xacts;
     my $global_commits;
     my $global_rollbacks;
-    my $ratio;
     my %warn;
     my %crit;
-    my %args = %{ $_[0] };
-    my $me   = 'POSTGRES_COMMIT_RATIO';
-    my $sql  = q{
+    my %args  = %{ $_[0] };
+    my $me    = 'POSTGRES_COMMIT_RATIO';
+    my $sql   = q{
         SELECT floor(extract(EPOCH from now())), s.datname,
             s.xact_commit, s.xact_rollback
         FROM pg_stat_database s
@@ -2479,8 +2693,9 @@ sub check_commit_ratio {
 
     return ok( $me, ['First call'] ) unless keys %xacts;
 
-    foreach my $db (keys %new_xacts) {
+    foreach my $db ( keys %new_xacts ) {
 
+        my $ratio = 0;
         my $commits   = $new_xacts{$db}{'commit'} - $xacts{$db}{'commit'};
         my $rollbacks = $new_xacts{$db}{'rollback'} - $xacts{$db}{'rollback'};
 
@@ -2494,17 +2709,15 @@ sub check_commit_ratio {
         $global_commits   += $commits;
         $global_rollbacks += $rollbacks;
 
-        push @perfdata, sprintf "'%s_commit_rate'=%.2ftps",   $db, $commit_rate;
-        push @perfdata, sprintf "'%s_rollback_rate'=%.2ftps", $db, $rollback_rate;
-        push @perfdata, sprintf "'%s_xact_rate'=%.2ftps",     $db, $xact_rate;
+        $ratio = $rollbacks * 100 / ( $commits + $rollbacks )
+            unless $rollbacks == 0;
 
-        if ( $rollbacks == 0) {
-            $ratio = 0;
-        } else {
-            $ratio = $rollbacks * 100 / ($commits + $rollbacks);
-        }
-
-        push @perfdata,  sprintf("'%s_rollback_ratio'=%.2f%%", $db, $ratio );
+        push @perfdata => (
+            [ "${db}_commit_rate",    sprintf( "%.2f", $commit_rate ),   'tps' ],
+            [ "${db}_rollback_rate",  sprintf( "%.2f", $rollback_rate ), 'tps' ],
+            [ "${db}_xact_rate",      sprintf( "%.2f", $xact_rate ),     'tps' ],
+            [ "${db}_rollback_ratio", sprintf( "%.2f", $ratio ),         '%'   ]
+        );
 
         THRESHOLD_LOOP: foreach my $val ( ('rollbacks', 'rollback_rate', 'rollback_ratio') ) {
             my $prefix = "${db}_${val}";
@@ -2566,7 +2779,6 @@ C<--no_check_fsync>, C<--no_check_enable>, C<--no_check_track_counts>.
 =cut
 
 sub check_configuration {
-    my @perfdata;
     my @hosts;
     my @msg_crit;
     my %args = %{ $_[0] };
@@ -2667,9 +2879,12 @@ The warning and critical arguments are optional. They can be of format integer
 Warning and Critical will be raised if they are greater than the first column,
 or less if the C<--reverse> option is used.
 
-All other columns will be used to generate the perfdata. The query must
-display them in the perfdata format, with unit if required (eg. "size=35B").
-If a field contains multiple values, they must be separated by a space.
+All other columns will be used to generate the perfdata. Each field name is used
+as the name of the perfdata. The field value must contain your perfdata value
+and its unit append to it. You can add as many field as needed. Eg.:
+
+  SELECT pg_database_size('postgres'),
+         pg_database_size('postgres')||'B' AS db_size
 
 =cut
 
@@ -2681,6 +2896,7 @@ sub check_custom_query {
     my $reverse = $args{'reverse'};
     my $bounded = undef;
     my @rs;
+    my @fields;
     my @perfdata;
     my @hosts;
     my @msg_crit;
@@ -2738,7 +2954,11 @@ sub check_custom_query {
         $c_limit = $args{'critical'};
     }
 
-    @rs = @{ query( $hosts[0], $sql ) };
+    @rs = @{ query( $hosts[0], $sql, undef, 1 ) };
+    @fields = @{ shift @rs };
+
+    return unknown( $me, [ 'No row returned by the query!' ] )
+        unless defined $rs[0];
 
     pod2usage(
         -message => 'FATAL: First column of your query is not numeric!',
@@ -2752,13 +2972,15 @@ sub check_custom_query {
             or ( $reverse and $rec->[0] < $bounded );
 
         $value = shift( @{$rec} );
-        if ( @{$rec} > 0 ) {
-            $perf = join(';',@{$rec});
-        } else{
-            $perf = undef;
-        }
+        shift @fields;
 
-        push @perfdata, $perf if defined $perf;
+        foreach my $perf ( @$rec ) {
+            my ( $val, $uom );
+            $perf =~ m{([0-9.]*)(.*)};
+            $val = $1 if defined $1;
+            $uom = $2 if defined $2;
+            push @perfdata => [ shift @fields, $val, $uom ];
+        }
 
         if ( ( defined $c_limit )
             and (
@@ -2766,8 +2988,7 @@ sub check_custom_query {
                 or ( $reverse and ( $value < $c_limit ) )
             )
         ) {
-            push @msg_crit =>
-                "value: $value ".( defined $perf ? "($perf)" : "" );
+            push @msg_crit => "value: $value";
             next DB_LOOP;
         }
 
@@ -2777,8 +2998,7 @@ sub check_custom_query {
                 or ( $reverse  and ( $value < $w_limit ) )
             )
         ) {
-            push @msg_warn =>
-                "value: $value ".( defined $perf ? "($perf)" : "" );
+            push @msg_warn => "value: $value";
             next DB_LOOP;
         }
     }
@@ -2869,7 +3089,7 @@ sub check_database_size {
         $c_limit = get_size( $args{'critical'}, $db->[1] );
         $delta = $db->[1] - $db_sizes{ $db->[0] };
 
-        push @perfdata => "$db->[0]=$db->[1]B;$w_limit;$c_limit";
+        push @perfdata => [ $db->[0], $db->[1], 'B', $w_limit, $c_limit ];
 
         if ( abs($delta) >= $c_limit ) {
             push @msg_crit => "$db->[0] ($delta, now: $db->[1])";
@@ -2955,7 +3175,7 @@ sub check_hit_ratio {
         my $ratio;
         my $hit_delta;
         my $read_delta;
-        my $perfdata_value;
+        my @perfdata_value;
 
         $new_db_hitratio{ $db->[0] } = [ $db->[1], $db->[2], 'NaN' ];
 
@@ -2972,27 +3192,28 @@ sub check_hit_ratio {
         # metrics moved since last run
         if ( $hit_delta + $read_delta > 0 ) {
             $ratio = 100 * $hit_delta / ( $hit_delta + $read_delta );
-            $ratio = int($ratio*100+0.05)/100;
+            # rounding the fractional part to 2 digits
+            $ratio = int($ratio*100+0.5)/100;
             $new_db_hitratio{ $db->[0] }[2] = $ratio;
 
-            $perfdata_value = sprintf "'%s'=%s%%", $db->[0], $ratio;
+            @perfdata_value = ( $db->[0], $ratio, '%' );
         }
         # no activity since last run, use previous hit ratio
         # this should not happen as the query itself hit/read.
         elsif ( $db->[1] + $db->[2] > 0 ) {
             $ratio = $db_hitratio{ $db->[0] }[2];
-            $perfdata_value = sprintf "'%s'=%s%%", $db->[0], $ratio;
+            @perfdata_value = ( $db->[0], $ratio, '%' );
         }
         # this database has no reported activity yet
         else {
             $new_db_hitratio{ $db->[0] }[2] = 'NaN';
-            $perfdata_value = sprintf "'%s'=NaN%%", $db->[0];
+            @perfdata_value = ( $db->[0], 'NaN', '%' );
         }
 
-        $perfdata_value .= ";$args{'warning'};$args{'critical'}"
+        push @perfdata_value => ( $args{'warning'}, $args{'critical'} )
             if defined $args{'critical'};
 
-        push @perfdata => $perfdata_value;
+        push @perfdata => \@perfdata_value;
 
         if ( defined $args{'critical'} ) {
             if ( $db->[1] < $args{'critical'} ) {
@@ -3029,8 +3250,9 @@ You must give the connection parameters for two or more clusters.
 Perfdata returns the data delta in bytes between the master and each Hot
 standby cluster listed.
 
-Critical and Warning thresholds can take one or two values separated by a
-comma. If only one value given, it applies to both received and replayed data.
+Critical and Warning thresholds are optional. They can take one or two values
+separated by a comma. If only one value given, it applies to both received and
+replayed data.
 If two values are given, the first one applies to received data, the second one
 to replayed ones. These thresholds only accept a size (eg. 2.5G).
 
@@ -3071,13 +3293,6 @@ sub check_hot_standby_delta {
             END
     ";
 
-    # warning and critical are mandatory.
-    pod2usage(
-        -message => "FATAL: you must specify critical and warning thresholds.",
-        -exitval => 127
-    ) unless defined $args{'warning'} and defined $args{'critical'} ;
-
-
     @hosts = @{ parse_hosts %args };
 
     pod2usage(
@@ -3085,8 +3300,9 @@ sub check_hot_standby_delta {
         -exitval => 127
     ) if @hosts < 2;
 
-    is_compat $hosts[0], 'hot_standby_delta', $PG_VERSION_90 or exit 1;
-    is_compat $hosts[1], 'hot_standby_delta', $PG_VERSION_90 or exit 1;
+    foreach my $host ( @hosts ) {
+        is_compat $host, 'hot_standby_delta', $PG_VERSION_90 or exit 1;
+    }
 
     # fetch LSNs
     foreach my $host (@hosts) {
@@ -3095,8 +3311,11 @@ sub check_hot_standby_delta {
         $master_location = $host->{'rs'}[1] if $host->{'rs'}[0];
     }
 
-    return critical($me, ["PostgreSQL major versions differ amongst clusters ($hosts[0]{'version'} vs. $hosts[1]{'version'})."] )
-        if substr($hosts[0]{'version_num'}, 0, -2) != substr($hosts[1]{'version_num'}, 0, -2);
+    # check all cluster have the same major version.
+    foreach my $host ( @hosts ) {
+        return critical($me, ["PostgreSQL major versions differ amongst clusters ($hosts[0]{'version'} vs. $host->{'version'})."] )
+            if substr($hosts[0]{'version_num'}, 0, -2) != substr($host->{'version_num'}, 0, -2);
+    }
 
     return critical($me, ['No cluster in production.'])
         if $num_clusters == 0;
@@ -3104,22 +3323,24 @@ sub check_hot_standby_delta {
     return critical($me, ['More than one cluster in production.'])
         if $num_clusters != 1;
 
-    ($w_limit_received, $w_limit_replayed) = split /,/, $args{'warning'};
-    ($c_limit_received, $c_limit_replayed) = split /,/, $args{'critical'};
+    if ( defined $args{'critical'} ) {
+        ($w_limit_received, $w_limit_replayed) = split /,/, $args{'warning'};
+        ($c_limit_received, $c_limit_replayed) = split /,/, $args{'critical'};
 
-    if (!defined($w_limit_replayed)) {
-        $w_limit_replayed = $w_limit_received;
-    }
-    if (!defined($c_limit_replayed)) {
-        $c_limit_replayed = $c_limit_received;
+        if (!defined($w_limit_replayed)) {
+            $w_limit_replayed = $w_limit_received;
+        }
+        if (!defined($c_limit_replayed)) {
+            $c_limit_replayed = $c_limit_received;
+        }
+
+        $w_limit_received = get_size( $w_limit_received );
+        $c_limit_received = get_size( $c_limit_received );
+        $w_limit_replayed = get_size( $w_limit_replayed );
+        $c_limit_replayed = get_size( $c_limit_replayed );
     }
 
     $wal_size = 4294967296 if $hosts[0]{'version_num'} >= $PG_VERSION_93;
-
-    $w_limit_received = get_size( $w_limit_received );
-    $c_limit_received = get_size( $c_limit_received );
-    $w_limit_replayed = get_size( $w_limit_replayed );
-    $c_limit_replayed = get_size( $c_limit_replayed );
 
     # we recycle this one to count the number of slave
     $num_clusters = 0;
@@ -3138,35 +3359,42 @@ sub check_hot_standby_delta {
 
         $host->{'name'} =~ s/ db=.*$//;
 
-        push @perfdata => "'receive delta $host->{'name'}'=".
-            ($host->{'receive_delta'} > 0 ? $host->{'receive_delta'}:0).
-            "B;$w_limit_received;$c_limit_received; 'replay delta $host->{'name'}'=".
-            ($host->{'replay_delta'} > 0 ? $host->{'replay_delta'}:0) .
-            "B;$w_limit_replayed;$c_limit_replayed"
-        ;
+        push @perfdata => ([
+            "receive delta $host->{'name'}",
+            $host->{'receive_delta'} > 0 ? $host->{'receive_delta'}:0, 'B',
+            $w_limit_received, $c_limit_received
+        ],
+        [
+            "replay delta $host->{'name'}",
+            $host->{'replay_delta'} > 0 ? $host->{'replay_delta'}:0, 'B',
+            $w_limit_replayed, $c_limit_replayed
+        ]);
 
-        if ($host->{'receive_delta'} > $c_limit_received) {
-            push @msg_crit, "critical receive lag: "
-            . to_size($host->{'receive_delta'}) . " for $host->{'name'}";
-            next;
-        }
+        if ( defined $args{'critical'} ) {
 
-        if ($host->{'replay_delta'} > $c_limit_replayed) {
-            push @msg_crit, "critical replay lag: "
-           . to_size($host->{'replay_delta'}) . " for $host->{'name'}";
-            next;
-        }
+            if ($host->{'receive_delta'} > $c_limit_received) {
+                push @msg_crit, "critical receive lag: "
+                    . to_size($host->{'receive_delta'}) . " for $host->{'name'}";
+                next;
+            }
 
-        if ($host->{'receive_delta'} > $w_limit_received) {
-            push @msg_warn, "warning receive lag: "
-           . to_size($host->{'receive_delta'}) . " for $host->{'name'}";
-            next;
-        }
+            if ($host->{'replay_delta'} > $c_limit_replayed) {
+                push @msg_crit, "critical replay lag: "
+                    . to_size($host->{'replay_delta'}) . " for $host->{'name'}";
+                next;
+            }
 
-        if ($host->{'replay_delta'} > $w_limit_replayed) {
-            push @msg_warn, "warning replay lag: "
-           . to_size($host->{'replay_delta'}) . " for $host->{'name'}";
-            next;
+            if ($host->{'receive_delta'} > $w_limit_received) {
+                push @msg_warn, "warning receive lag: "
+                    . to_size($host->{'receive_delta'}) . " for $host->{'name'}";
+                next;
+            }
+
+            if ($host->{'replay_delta'} > $w_limit_replayed) {
+                push @msg_warn, "warning replay lag: "
+                    . to_size($host->{'replay_delta'}) . " for $host->{'name'}";
+                next;
+            }
         }
 
         $num_clusters++;
@@ -3210,7 +3438,7 @@ sub check_is_hot_standby {
     is_compat $hosts[0], 'is_hot_standby', $PG_VERSION_90 or exit 1;
     @rs = @{ query_ver( $hosts[0], %queries )->[0] };
 
-    return critical( $me, [ "Cluster is not hot standby" ] ) if ( $rs[0] eq "f" );
+    return critical( $me, [ "Cluster is not hot standby" ] ) if $rs[0] eq "f";
     return ok( $me, [ "Cluster is hot standby" ] );
 }
 
@@ -3234,10 +3462,8 @@ sub check_is_master {
     #For PostgreSQL 9.0+, the "pg_is_in_recovery()" function is used, for previous
     #versions the ability to connect is enough.
     my %queries       = (
-       $PG_VERSION_74 => q{SELECT false
-       },
-        $PG_VERSION_90 => q{SELECT pg_is_in_recovery()
-        }
+        $PG_VERSION_74  => q{ SELECT false },
+        $PG_VERSION_90 => q{ SELECT pg_is_in_recovery() }
     );
 
     @hosts = @{ parse_hosts %args };
@@ -3249,8 +3475,107 @@ sub check_is_master {
 
     @rs = @{ query_ver( $hosts[0], %queries )->[0] };
 
-    return critical( $me, [ "Cluster is not master" ] ) if ( $rs[0] eq "t" );
+    return critical( $me, [ "Cluster is not master" ] ) if $rs[0] eq "t";
     return ok( $me, [ "Cluster is master" ] );
+}
+
+=item B<invalid_indexes>
+
+Check if there is any invalid indexes in a database.
+
+A critical alert is raised if an invalid index is detected.
+
+This service supports both C<--dbexclude>  and C<--dbinclude> parameters.
+
+This service supports a C<--exclude REGEX>  parameter to exclude indexes
+matching the given regular expression. The regular expression applies to
+"database.schema_name.index_name". This allows you to filter either on a
+relation name for all schemas and databases, filter on a qualified named
+index (schema + index) for all databases or filter on a qualified named
+index in only one database.
+
+You can use multiple C<--exclude REGEX>  parameters.
+
+Perfdata will return the number of invalid indexes per database.
+
+A list of invalid indexes detail will be returned after the
+perfdata. This list contains the fully qualified index name. If
+excluded index is set, the number of exclude index is returned.
+
+=cut
+
+sub check_invalid_indexes {
+    my @perfdata;
+    my @longmsg;
+    my @rs;
+    my @hosts;
+    my @all_db;
+    my $total_idx   = 0; # num of table checked, without excluded ones
+    my $total_extbl = 0; # num of excluded table
+    my $c_count     = 0;
+    my %args        = %{ $_[0] };
+    my @dbinclude   = @{ $args{'dbinclude'} };
+    my @dbexclude   = @{ $args{'dbexclude'} };
+    my $me          = 'POSTGRES_INVALID_INDEXES';
+    my $query       = q{
+    SELECT current_database(), nsp.nspname AS schemaname, cls.relname, idx.indisvalid
+        FROM pg_class cls
+            join pg_namespace nsp on nsp.oid = cls.relnamespace
+            join pg_index idx on idx.indexrelid = cls.oid
+        WHERE
+            cls.relkind = 'i'
+        AND nsp.nspname not like 'pg_toast%'
+        AND nsp.nspname NOT IN ('information_schema', 'pg_catalog');
+    };
+
+    @hosts = @{ parse_hosts %args };
+
+    pod2usage(
+        -message => 'FATAL: you must give one (and only one) host with service "invalid_indexes".',
+        -exitval => 127
+    ) if @hosts != 1;
+
+    @all_db = @{ get_all_dbname( $hosts[0] ) };
+
+    # Iterate over all db
+    ALLDB_LOOP: foreach my $db ( sort @all_db ) {
+
+        my @rc;
+        my $nb_idx      = 0;
+        my $idx_invalid = 0;
+
+        next ALLDB_LOOP if grep { $db =~ /$_/ } @dbexclude;
+        next ALLDB_LOOP if @dbinclude and not grep { $db =~ /$_/ } @dbinclude;
+
+        @rc = @{ query( $hosts[0], $query, $db ) };
+
+        INVALIDIDX_LOOP: foreach my $invalid (@rc) {
+            foreach my $exclude_re ( @{ $args{'exclude'} } ) {
+                if ("$invalid->[0].$invalid->[1].$invalid->[2]" =~ m/$exclude_re/){
+                    $total_extbl++;
+                    next INVALIDIDX_LOOP ;
+                }
+            }
+            if ($invalid->[3] eq "f") {
+                # long message info :
+                push @longmsg => sprintf "Invalid index = %s.%s.%s ; ",
+                    $invalid->[0], $invalid->[1], $invalid->[2];
+                $idx_invalid++;
+            }
+            $nb_idx++;
+        }
+        $total_idx += $nb_idx;
+        $c_count += $idx_invalid;
+        push @perfdata => ["invalid index in $db", $idx_invalid ];
+    }
+    push @longmsg => sprintf "%i index(es) exclude from check", $total_extbl
+        if $total_extbl > 0;
+
+    # we use the critical count for the **total** number of invalid index
+    return critical $me, [ "$c_count/$total_idx index(es) invalid" ],
+        \@perfdata, \@longmsg if $c_count > 0;
+
+    return ok $me, [ "No invalid index" ], \@perfdata, \@longmsg ;
 }
 
 
@@ -3326,12 +3651,14 @@ sub check_is_replay_paused {
 
     return unknown ( $me,
         [ "Server is not standby." ],
-        [ "is_paused=NaN", "lag_time=NaNs", "has_data_delta=NaNs" ]
+        [ [ 'is_paused', 'NaN' ],
+          [ 'lag_time', 'NaN', 's' ],
+          [ 'has_data_delta', 'NaN', 's' ] ]
     ) if not $rs[0];
 
-    push @perfdata, "is_paused=". $rs[1];
-    push @perfdata, "lag_time=". $rs[2] . "s";
-    push @perfdata, "has_data_delta=". $rs[3];
+    push @perfdata, [ "is_paused", $rs[1] ];
+    push @perfdata, [ "lag_time", $rs[2], "s" ];
+    push @perfdata, [ "has_data_delta", $rs[3] ];
 
     # Always return ok if replay is not paused
     return ok( $me, [ ' replay is not paused' ], \@perfdata ) if not $rs[1];
@@ -3345,7 +3672,6 @@ sub check_is_replay_paused {
     }
 
     return ok( $me, [ ' replay is paused.' ], \@perfdata );
-
 }
 
 
@@ -3418,7 +3744,7 @@ sub check_last_maintenance {
         if $hosts[0]->{'version_num'} >= $PG_VERSION_91;
 
 LOOP_DB: foreach my $db (@all_db) {
-        my $perfdata;
+        my @perf;
         my $rs;
 
         next LOOP_DB if grep { $db =~ /$_/ } @dbexclude;
@@ -3429,7 +3755,7 @@ LOOP_DB: foreach my $db (@all_db) {
         $rs = query_ver( $hosts[0], %queries, $db )->[0];
         $db =~ s/=//g;
 
-        $perfdata = "'$db'=$rs->[0]s;$w_limit;$c_limit";
+        push @perfdata => [ $db, $rs->[0], 's', $w_limit, $c_limit ];
 
         if ($hosts[0]->{'version_num'} >= $PG_VERSION_91 ) {
             $new_counts{$db} = [$rs->[1], $rs->[2]];
@@ -3438,12 +3764,12 @@ LOOP_DB: foreach my $db (@all_db) {
                 my $delta      = $rs->[1] - $counts{$db}[0];
                 my $delta_auto = $rs->[2] - $counts{$db}[1];
 
-                $perfdata .= " '$db $type'=$delta"
-                    ." '$db auto$type'=$delta_auto";
+                push @perfdata => (
+                    [ "$db $type", $delta ],
+                    [ "$db auto$type", $delta_auto ]
+                );
             }
         }
-
-        push @perfdata => $perfdata;
 
         if ( $rs->[0] =~ /^-inf/i or $rs->[0] >= $c_limit ) {
             push @msg_crit => "$db: " . to_interval($rs->[0]);
@@ -3551,7 +3877,7 @@ sub check_locks {
     my $me            = 'POSTGRES_LOCKS';
     my %queries       = (
         $PG_VERSION_74 => q{
-            SELECT count(l.*), ref.mode,
+            SELECT count(l.granted), ref.mode,
                 current_setting('max_locks_per_transaction')::integer
                 * current_setting('max_connections')::integer, 0, ref.granted
             FROM (
@@ -3578,7 +3904,7 @@ sub check_locks {
             ORDER BY ref.granted, ref.mode
         },
         $PG_VERSION_82 => q{
-            SELECT count(l.*), ref.mode,
+            SELECT count(l.granted), ref.mode,
                 current_setting('max_locks_per_transaction')::integer * (
                     current_setting('max_prepared_transactions')::integer
                     + current_setting('max_connections')::integer), 0, ref.granted
@@ -3607,7 +3933,7 @@ sub check_locks {
             ORDER BY ref.granted, ref.mode
         },
         $PG_VERSION_91 => q{
-            SELECT count(l.*), ref.mode,
+            SELECT count(l.granted), ref.mode,
                 current_setting('max_locks_per_transaction')::integer * (
                     current_setting('max_prepared_transactions')::integer
                     + current_setting('max_connections')::integer),
@@ -3679,16 +4005,16 @@ sub check_locks {
         if ($_->[4] eq 't') {
             if ($_->[1] ne 'SIReadLock') {
                 push @perfdata =>
-                    ( "$_->[1]=$_->[0];$args{'warning'};$args{'critical'}" );
+                    [ $_->[1], $_->[0], undef, $args{'warning'}, $args{'critical'} ];
             } else {
                 push @perfdata =>
-                    ( "$_->[1]=$_->[0];$args{'predwarning'};$args{'predcritical'}" );
+                    [ $_->[1], $_->[0], undef, $args{'predwarning'}, $args{'predcritical'} ];
             }
         }
         else {
             $waiting_locks += $_->[0];
             push @perfdata =>
-                ( "'Waiting $_->[1]'=$_->[0];$args{'warning'};$args{'critical'}" );
+                [ "Waiting $_->[1]", $_->[0], undef, $args{'warning'}, $args{'critical'} ];
         }
     } @rs;
 
@@ -3830,9 +4156,9 @@ sub check_longest_query {
         }
 
         push @perfdata, (
-            "'$db max'=$stats{$db}{'max'}s;$w_limit;$c_limit",
-            "'$db avg'=$stats{$db}{'avg'}s;$w_limit;$c_limit",
-            "'$db #queries'=$stats{$db}{'num'}"
+            [ "$db max", $stats{$db}{'max'}, 's', $w_limit, $c_limit ],
+            [ "$db avg", $stats{$db}{'avg'}, 's', $w_limit, $c_limit ],
+            [ "$db #queries", $stats{$db}{'num'} ]
         );
 
         if ( $stats{$db}{'max'} > $c_limit ) {
@@ -3937,7 +4263,7 @@ sub check_max_freeze_age {
     }
 
     REC_LOOP: foreach my $r (@rs) {
-        my $perfdata_value;
+        my @perf;
 
         next REC_LOOP if grep { $r->[0] =~ /$_/ } @dbexclude;
         next REC_LOOP if @dbinclude and not grep { $r->[0] =~ /$_/ } @dbinclude;
@@ -3947,12 +4273,11 @@ sub check_max_freeze_age {
             $oldestage = $r->[1];
         }
 
-        $perfdata_value = "'$r->[0]'=$r->[1]";
+        @perf = ( $r->[0], $r->[1] );
 
-        $perfdata_value .= ";$w_limit;$c_limit"
-            if defined $c_limit;
+        push @perf => ( undef, $w_limit, $c_limit ) if defined $c_limit;
 
-        push @perfdata => $perfdata_value;
+        push @perfdata => [ @perf ];
 
         if ( $r->[1] < 0 ) {
             push @msg_crit => "$r->[0] has a negative age" ;
@@ -4110,7 +4435,7 @@ sub check_minor_version {
         return unknown( $me, \@msg );
     }
 
-    push @perfdata => "version=". $hosts[0]{'version_num'} . "PGNUMVER";
+    push @perfdata => [ 'version', $hosts[0]{'version_num'}, 'PGNUMVER' ];
 
     if ( $hosts[0]{'version_num'} != $latest_versions{$major_version}[0] ) {
         push @msg => "PostgreSQL version ". $hosts[0]{'version'}
@@ -4217,9 +4542,9 @@ sub check_oldest_2pc {
         }
 
         push @perfdata, (
-            "'$db max'=$stats{$db}{'max'}s;$w_limit;$c_limit",
-            "'$db avg'=$stats{$db}{'avg'}s;$w_limit;$c_limit",
-            "'$db # prep. xact'=$stats{$db}{'num'}"
+            [ "$db max", $stats{$db}{'max'}, 's', $w_limit, $c_limit ],
+            [ "$db avg", $stats{$db}{'avg'}, 's', $w_limit, $c_limit ],
+            [ "$db # prep. xact", $stats{$db}{'num'} ]
         );
 
         if ( $stats{$db}{'max'} > $c_limit ) {
@@ -4345,9 +4670,9 @@ sub check_oldest_idlexact {
         }
 
         push @perfdata, (
-            "'$db max'=$stats{$db}{'max'}s;$w_limit;$c_limit",
-            "'$db avg'=$stats{$db}{'avg'}s;$w_limit;$c_limit",
-            "'$db # idle xact'=$stats{$db}{'num'}"
+            [ "$db max", $stats{$db}{'max'}, 's', $w_limit, $c_limit ],
+            [ "$db avg", $stats{$db}{'avg'}, 's', $w_limit, $c_limit ],
+            [ "$db # idle xact", $stats{$db}{'num'} ]
         );
 
         if ( $stats{$db}{'max'} > $c_limit ) {
@@ -4520,8 +4845,10 @@ sub check_pg_dump_backup {
         next if $now - $mtime < $min_age;
 
         if ( $global_pattern and $filename =~ $global_pattern ) {
-            $firsts{'globals_objects'} = [ $mtime, $size ];
-            $lasts{'globals_objects'}  = [ $mtime, $size ];
+            $firsts{'globals_objects'} = [ $mtime, $size ] if not exists $firsts{'globals_objects'}
+                or $firsts{'globals_objects'}[0] > $mtime;
+            $lasts{'globals_objects'}  = [ $mtime, $size ] if not exists $lasts{'globals_objects'}
+                or $lasts{'globals_objects'}[0] < $mtime;
         }
 
         next unless $filename =~ $pattern and defined $1;
@@ -4543,7 +4870,6 @@ sub check_pg_dump_backup {
         @rs = @{ query( $hosts[0], $sql ) };
     }
 
-
     # If global_pattern is defined, add them to the list to check
     push @rs => [ "globals_objects" ] if $global_pattern;
 
@@ -4552,10 +4878,10 @@ sub check_pg_dump_backup {
 
     ALLDB: foreach my $row ( @rs ) {
         my $db = $row->[0];
-        my $perf_newest = '';
-        my $perf_oldest = '';
-        my $perf_delta  = '';
-        my $perf_size   = '';
+        my @perf_newest;
+        my @perf_oldest;
+        my @perf_delta;
+        my @perf_size;
         my $last_age;
         my $first_age;
 
@@ -4567,24 +4893,30 @@ sub check_pg_dump_backup {
             push @msg_crit => sprintf("'%s_oldest'=NaNs", $db);
             push @msg_crit => sprintf("'%s_newest'=NaNs", $db);
             push @msg_crit => sprintf("'%s_size'=NaNB", $db);
+            @perf_oldest = ( "${db}_oldest", 'NaN', 's' );
+            @perf_newest = ( "${db}_newest", 'NaN', 's' );
+            @perf_size   = ( "${db}_size",   'NaN', 'B' );
+            @perf_delta  = ( "${db}_delta",  'NaN', 'B' );
+            push @perfdata => ( \@perf_newest, \@perf_oldest, \@perf_size, \@perf_delta );
             next;
         }
 
         $last_age  = $now - $lasts{$db}[0];
         $first_age = $now - $firsts{$db}[0];
 
-        $perf_oldest = sprintf "'%s_oldest'=%ss", $db, $first_age;
-        $perf_newest = sprintf "'%s_newest'=%ss", $db, $last_age;
-        $perf_size   = sprintf "'%s_size'=%sB", $db, $lasts{$db}[1];
-        $perf_delta  = sprintf "'%s_delta'=%sB", $db,
-            $lasts{$db}[1] - $db_sizes{$db}[1];
+        @perf_oldest = ( "${db}_oldest", $first_age,     's' );
+        @perf_newest = ( "${db}_newest", $last_age,      's' );
+        @perf_size   = ( "${db}_size",   $lasts{$db}[1], 'B' );
+        @perf_delta  = exists $db_sizes{$db} ?
+            ( "${db}_delta",  $lasts{$db}[1] - $db_sizes{$db}[1], 'B' )
+            : ( "${db}_delta",  0, 'B' );
 
         if ( exists $warn{'newest'} or exists $crit{'newest'} ) {
             my $c_limit = $crit{'newest'};
             my $w_limit = $warn{'newest'};
 
-            $perf_newest .= ( defined $w_limit ? ";$w_limit":";" );
-            $perf_newest .= ";$c_limit" if defined $c_limit;
+            push @perf_newest => ( defined $w_limit ? $w_limit : undef );
+            push @perf_newest => ( defined $c_limit ? $c_limit : undef );
 
             if ( defined $c_limit and $last_age > $c_limit ) {
                 push @msg_crit => sprintf("'%s_newest'=%s", $db,
@@ -4602,8 +4934,8 @@ sub check_pg_dump_backup {
             my $c_limit = $crit{'oldest'};
             my $w_limit = $warn{'oldest'};
 
-            $perf_oldest .= ( defined $w_limit ? ";$w_limit":";" );
-            $perf_oldest .= ";$c_limit" if defined $c_limit;
+            push @perf_oldest => ( defined $w_limit ? $w_limit : undef );
+            push @perf_oldest => ( defined $c_limit ? $c_limit : undef );
 
             if ( defined $c_limit and $first_age > $c_limit ) {
                 push @msg_crit => sprintf("'%s_oldest'=%s", $db,
@@ -4626,8 +4958,8 @@ sub check_pg_dump_backup {
                 if exists $crit{'size'};
             my $delta = abs( $lasts{$db}[1] - $db_sizes{$db}[1] );
 
-            $perf_delta .= ( defined $w_delta ? ";$w_delta":";" );
-            $perf_delta .= ";$c_delta" if defined $c_delta;
+            push @perf_delta => ( defined $w_delta ? $w_delta: undef );
+            push @perf_delta => ( defined $c_delta ? $c_delta: undef );
 
             if ( defined $c_delta and $delta > $c_delta ) {
                 push @msg_crit => sprintf("'%s_delta'=%dB", $db, $lasts{$db}[1]);
@@ -4637,7 +4969,7 @@ sub check_pg_dump_backup {
             }
         }
 
-        push @perfdata => ( $perf_newest, $perf_oldest, $perf_size, $perf_delta );
+        push @perfdata => ( \@perf_newest, \@perf_oldest, \@perf_size, \@perf_delta );
     }
 
     save $hosts[0], 'pg_dump_backup', \%lasts, $args{'status-file'}
@@ -4678,8 +5010,8 @@ sub check_pga_version {
     pod2usage(
         -message => "FATAL: given version does not look like a check_pgactivity version!",
         -exitval => 127
-    ) if ( defined $args{'critical'} and $args{'critical'} !~ m/^\d\.\d+(?:beta\d*)?$/ )
-        or (defined $args{'warning'} and $args{'warning'} !~ m/^\d\.\d+(?:beta\d*)?$/ );
+    ) if ( defined $args{'critical'} and $args{'critical'} !~ m/^\d\.\d+(?:_?(?:beta|rc)\d*)?$/ )
+        or (defined $args{'warning'} and $args{'warning'} !~ m/^\d\.\d+(?:_?(?:beta|rc)\d*)?$/ );
 
     return critical( $me,
         [ sprintf($msg, "(should be $args{'critical'}!)", $^V) ]
@@ -4693,58 +5025,96 @@ sub check_pga_version {
 }
 
 
-=item B<ready_archives> (8.1+)
+=item B<archiver> (8.1+)
 
-Check the number of WAL files ready to archive.
+Check if the archiver is working properly and the number of WAL files ready to
+archive.
 
 Perfdata returns the number of WAL files waiting to be archived.
 
-Critical and Warning thresholds only accept a raw number of files.
+Critical and Warning thresholds are optional. They apply on the number of file
+waiting to be archived. They only accept a raw number of files.
+
+Whatever the given threshold, a critical alert is raised if the archiver process
+did not archive the oldest waiting WAL to be archived since last call.
 
 =cut
 
-sub check_ready_archives {
+sub check_archiver {
     my @rs;
     my @perfdata;
     my @msg;
+    my @longmsg;
     my @hosts;
+    my $prev_archiving;
+    my $nb_files;
     my %args  = %{ $_[0] };
-    my $me    = 'POSTGRES_READY_ARCHIVES';
+    my $me    = 'POSTGRES_ARCHIVER';
+    # cf. pgarch_readyXlog in src/backend/postmaster/pgarch.c about how the
+    # archiver process pick the next WAL to archive.
+    # We try to reproduce the same algo here
     my $query = q{
-         SELECT count(*) AS count
-         FROM pg_ls_dir('pg_xlog/archive_status') as file
-         WHERE file ~ '^[0-9A-F]{24}.ready$' };
-
-    # warning and critical are mandatory.
-    pod2usage(
-        -message => "FATAL: you must specify critical and warning thresholds.",
-        -exitval => 127
-    ) unless defined $args{'warning'} and defined $args{'critical'} ;
+         SELECT s.f,
+           extract(epoch from (pg_stat_file('pg_xlog/archive_status/'||s.f)).modification),
+           extract(epoch from current_timestamp)
+         FROM pg_ls_dir('pg_xlog/archive_status') AS s(f)
+         WHERE f ~ '^[0123456789ABCDEF.history.backup.partial]{16,40}\.ready$'
+         ORDER BY s.f ASC
+    };
 
     # warning and critical must be raw
     pod2usage(
         -message => "FATAL: critical and warning thresholds only accept raw numbers.",
         -exitval => 127
-    ) unless $args{'warning'}  =~ m/^([0-9]+)$/
-        and  $args{'critical'} =~ m/^([0-9]+)$/;
+    ) if defined $args{'critical'} and $args{'warning'} !~ m/^([0-9]+)$/
+        and  $args{'critical'} !~ m/^([0-9]+)$/;
 
     @hosts = @{ parse_hosts %args };
 
     pod2usage(
-        -message => 'FATAL: you must give only one host with service "ready_archives".',
+        -message => 'FATAL: you must give only one host with service "archiver".',
         -exitval => 127
     ) if @hosts != 1;
 
-    is_compat $hosts[0], 'ready_archives', $PG_VERSION_81 or exit 1;
+    is_compat $hosts[0], 'archiver', $PG_VERSION_81 or exit 1;
 
-    @rs = @{ query( $hosts[0], $query )->[0] };
+    $prev_archiving = load( $hosts[0], 'archiver', $args{'status-file'} ) || '';
 
-    push @perfdata => "ready_archives=$rs[0];$args{'warning'};$args{'critical'}";
+    @rs = @{ query( $hosts[0], $query ) };
 
-    push @msg => "$rs[0] WAL files ready to archive";
+    $nb_files = scalar @rs;
 
-    return critical( $me, \@msg, \@perfdata ) if $rs[0] >= $args{'critical'};
-    return warning( $me, \@msg, \@perfdata ) if $rs[0] >= $args{'warning'};
+    push @perfdata => [ 'ready_archive', $nb_files, undef, $args{'warning'}, $args{'critical'}, 0 ];
+
+    if ( $nb_files > 0 ) {
+        push @perfdata => [ 'oldest_ready_wal', int( $rs[0][2] - $rs[0][1] ), 's',
+                            undef, undef, 0 ];
+
+        if ( $rs[0][0] ne $prev_archiving ) {
+            save $hosts[0], 'archiver', $rs[0][0], $args{'status-file'};
+        }
+        else {
+            push @msg => sprintf 'archiver stalling', substr($rs[0][0], 0, 24);
+            push @longmsg => sprintf '"%s" not archived since last check',
+                                substr($rs[0][0], 0, -6);
+        }
+    }
+    else {
+        push @perfdata => [ 'oldest_ready_wal', 0, 's', undef, undef, 0 ];
+        save $hosts[0], 'archiver', '', $args{'status-file'};
+    }
+
+    push @msg => "$nb_files WAL files ready to archive";
+
+    return critical( $me, \@msg, \@perfdata, \@longmsg ) if scalar @msg > 1;
+
+    if ( defined $args{'critical'} and $nb_files >= $args{'critical'} ) {
+        return critical( $me, \@msg, \@perfdata );
+    }
+    elsif ( defined $args{'warning'} and $nb_files >= $args{'warning'} ) {
+        return warning( $me, \@msg, \@perfdata );
+    }
+
     return ok( $me, \@msg, \@perfdata );
 }
 
@@ -4810,7 +5180,7 @@ sub check_replication_slots {
     @rs = @{ query( $hosts[0], $query ) };
 
 SLOTS_LOOP: foreach my $row (@rs) {
-        push @perfdata => "$row->[0]=$row->[1]";
+        push @perfdata => [ $row->[0], $row->[1] ];
 
         if ( defined $args{'warning'} ) {
 
@@ -4835,6 +5205,92 @@ SLOTS_LOOP: foreach my $row (@rs) {
     return ok( $me, [ "Replication slots OK" ], \@perfdata );
 }
 
+=item B<settings> (9.0+)
+
+Check if the settings changed compared to the known ones from last call of this
+service.
+
+The "known" settings are recorded during the very first call of the service.
+To update the known settings after a configuration change, call this service
+again with the argument C<--save>.
+
+No perfdata.
+
+Critical and Warning thresholds are ignored.
+
+A CRITICAL is raised if at least one parameter changed.
+
+=cut
+
+sub check_settings {
+    my $me  = 'POSTGRES_SETTINGS';
+    my @long_msg;
+    my @hosts;
+    my @rs;
+    my %settings;
+    my %new_settings;
+    my %args  = %{ $_[0] };
+    my $query = q{
+        SELECT coalesce(r.rolname, '*'), coalesce(d.datname, '*'),
+               unnest(s.setconfig) AS setting
+        FROM pg_db_role_setting s
+        LEFT JOIN pg_database d ON d.oid=s.setdatabase
+        LEFT JOIN pg_roles r ON r.oid=s.setrole
+        UNION ALL
+        SELECT '*', '*', name||'='||current_setting(name)
+        FROM pg_settings
+    };
+
+    @hosts = @{ parse_hosts %args };
+
+    is_compat $hosts[0], 'settings', $PG_VERSION_90 or exit 1;
+
+    @rs = @{ query( $hosts[0], $query ) };
+
+    %settings = %{ load( $hosts[0], 'settings', $args{'status-file'} ) || {} };
+
+    # save setting on the very first call
+    $args{'save'} = 1 unless %settings;
+
+PARAM_LOOP: foreach my $row (@rs) {
+        my ( $rolname, $datname, $setting ) = @$row;
+        my ( $name, $val ) = split /=/ => $setting, 2;
+        my $prefix = "$rolname\@$datname";
+        my $msg = "$setting";
+
+        $msg = "$prefix: $setting" unless $prefix eq '*@*';
+
+        $new_settings{$name}{$prefix} = $val;
+
+        push @long_msg => $msg unless exists $settings{$name}{$prefix};
+
+        push @long_msg => $msg if exists $settings{$name}{$prefix}
+                                  and $val ne $settings{$name}{$prefix};
+
+        delete $settings{$name}{$prefix};
+
+    }
+
+    # gather remaining settings that has not been processed
+    foreach my $s ( keys %settings ) {
+        foreach my $p ( keys %{ $settings{$s} } ) {
+            my $prefix = ( $p eq "*@*"? ":" : " $p:" );
+
+            push @long_msg => "missing$prefix $s=$settings{$s}{$p}";
+        }
+    }
+
+    if ( $args{'save'} ) {
+        save $hosts[0], 'settings', \%new_settings, $args{'status-file'};
+        return ok( $me, [ "Setting saved" ] )
+    }
+
+    return warning( $me, [ 'Setting changed!' ], undef, \@long_msg )
+        if scalar @long_msg;
+
+    return ok( $me, [ "Setting OK" ] );
+}
+
 
 =item B<streaming_delta> (9.1+)
 
@@ -4853,11 +5309,11 @@ Either of the two following examples will check for the presence of two slaves:
 Perfdata returns the data delta in bytes between the master and all standbys
 found and the number of slaves connected.
 
-Critical and Warning thresholds can take one or two values separated by a
-comma. If only one value is supplied, it applies to both flushed and replayed
-data. If two values are supplied, the first one applies to flushed data,
-the second one to replayed data.
-These thresholds only accept a size (eg. 2.5G).
+Critical and Warning thresholds are optional. They can take one or two values
+separated by a comma. If only one value is supplied, it applies to both flushed
+and replayed data. If two values are supplied, the first one applies to flushed
+data, the second one to replayed data. These thresholds only accept a size
+(eg. 2.5G).
 
 =cut
 
@@ -4890,13 +5346,6 @@ sub check_streaming_delta {
     );
     # FIXME this service should check for given slaves in opts!
 
-    # warning and critical are mandatory.
-    pod2usage(
-        -message => "FATAL: you must specify critical and warning thresholds.",
-        -exitval => 127
-    ) unless defined $args{'warning'} and defined $args{'critical'} ;
-
-
     @hosts = @{ parse_hosts %args };
 
     pod2usage(
@@ -4914,29 +5363,31 @@ sub check_streaming_delta {
 
     @rs = @{ query_ver( $hosts[0], %queries ) };
 
-    return unknown($me, ['No slaves connected'], ["'# of slaves'=0"])
-        unless @rs;
+    push @perfdata => [ '# of slaves', scalar @rs || 0 ];
+
+    return unknown( $me, ['No slaves connected'], \@perfdata )
+        unless scalar @rs;
 
     $rs[0][7] =~ m{^([0-9A-F]+)/([0-9A-F]+)$};
     $master_location = ( $wal_size * hex($1) ) + hex($2);
 
-    ($w_limit_flushed, $w_limit_replayed) = split /,/, $args{'warning'};
-    ($c_limit_flushed, $c_limit_replayed) = split /,/, $args{'critical'};
+    if ( defined $args{'critical'} ) {
 
-    if (!defined($w_limit_replayed)) {
-        $w_limit_replayed = $w_limit_flushed;
+        ($w_limit_flushed, $w_limit_replayed) = split /,/, $args{'warning'};
+        ($c_limit_flushed, $c_limit_replayed) = split /,/, $args{'critical'};
+
+        if (!defined($w_limit_replayed)) {
+            $w_limit_replayed = $w_limit_flushed;
+        }
+        if (!defined($c_limit_replayed)) {
+            $c_limit_replayed = $c_limit_flushed;
+        }
+
+        $w_limit_flushed = get_size( $w_limit_flushed );
+        $c_limit_flushed = get_size( $c_limit_flushed );
+        $w_limit_replayed = get_size( $w_limit_replayed );
+        $c_limit_replayed = get_size( $c_limit_replayed );
     }
-    if (!defined($c_limit_replayed)) {
-        $c_limit_replayed = $c_limit_flushed;
-    }
-
-    $w_limit_flushed = get_size( $w_limit_flushed );
-    $c_limit_flushed = get_size( $c_limit_flushed );
-    $w_limit_replayed = get_size( $w_limit_replayed );
-    $c_limit_replayed = get_size( $c_limit_replayed );
-
-
-    push @perfdata => "'# of slaves'=". scalar @rs;
 
     # compute deltas
     foreach my $host (@rs) {
@@ -4960,38 +5411,43 @@ sub check_streaming_delta {
 
         $name = "$host->[0]\@$host->[1]";
 
-        push @perfdata => "'sent delta $name'=${send_delta}B ".
-            "'wrote delta $name'=${write_delta}B ".
-            "'flushed delta $name'=${flush_delta}B ".
-            "'replay delta $name'=${replay_delta}B ".
-            "'pid $name'=$host->[2]";
+        push @perfdata => (
+            [ "sent delta $name",    $send_delta,   "B" ],
+            [ "wrote delta $name",   $write_delta,  "B" ],
+            [ "flushed delta $name", $flush_delta,  "B", $w_limit_flushed, $c_limit_flushed ],
+            [ "replay delta $name",  $replay_delta, "B", $w_limit_replayed, $c_limit_replayed ],
+            [ "pid $name", $host->[2] ]
+        );
 
         $num_clusters++;
 
         $slaves{"$host->[0] $host->[1]"} = 1;
 
-        if ($flush_delta > $c_limit_flushed) {
-            push @msg_crit, "critical flush lag: " . to_size($flush_delta)
-            . " for $name";
-            next;
-        }
+        if ( defined $args{'critical'} ) {
 
-        if ($replay_delta > $c_limit_replayed) {
-            push @msg_crit, "critical replay lag: " . to_size($replay_delta)
-           . " for $name";
-            next;
-        }
+            if ($flush_delta > $c_limit_flushed) {
+                push @msg_crit, "critical flush lag: " . to_size($flush_delta)
+                    . " for $name";
+                next;
+            }
 
-        if ($flush_delta > $w_limit_flushed) {
-            push @msg_warn, "warning flush lag: ". to_size($flush_delta)
-           . " for $name";
-            next;
-        }
+            if ($replay_delta > $c_limit_replayed) {
+                push @msg_crit, "critical replay lag: " . to_size($replay_delta)
+                    . " for $name";
+                next;
+            }
 
-        if ($replay_delta > $w_limit_replayed) {
-            push @msg_warn, "warning replay lag: " . to_size($replay_delta)
-           . " for $name";
-            next;
+            if ($flush_delta > $w_limit_flushed) {
+                push @msg_warn, "warning flush lag: ". to_size($flush_delta)
+                    . " for $name";
+                next;
+            }
+
+            if ($replay_delta > $w_limit_replayed) {
+                push @msg_warn, "warning replay lag: " . to_size($replay_delta)
+                    . " for $name";
+                next;
+            }
         }
     }
 
@@ -5105,8 +5561,7 @@ sub check_table_unlogged {
 
         $total_tbl += $nb_tbl;
         $c_count += $tbl_unlogged;
-        push @perfdata => sprintf "'table unlogged in %s'=%s",
-                $db, $tbl_unlogged;
+        push @perfdata => [ "table unlogged in $db", $tbl_unlogged ];
     }
 
     if ($total_extbl > 0){
@@ -5119,10 +5574,8 @@ sub check_table_unlogged {
             if $c_count > 0;
     return ok $me,
         [ "No unlogged table" ],
-        [ @perfdata ], [ @longmsg ];
-
+        \@perfdata, \@longmsg;
 }
-
 
 =item B<table_bloat>
 
@@ -5396,18 +5849,17 @@ sub check_table_bloat {
 
         $total_tbl += $nb_tbl;
 
-        push @perfdata => sprintf "'table bloated in %s'=%s",
-                $db, $tbl_bloated;
+        push @perfdata => [ "table bloated in $db", $tbl_bloated ];
     }
 
     # we use the warning count for the **total** number of bloated table
     return critical $me,
         [ "$w_count/$total_tbl table(s) bloated" ],
-        [ @perfdata ], [ @longmsg ]
+        \@perfdata, [ @longmsg ]
             if $c_count > 0;
     return warning $me,
         [ "$w_count/$total_tbl table(s) bloated" ],
-        [ @perfdata ], [ @longmsg ]
+        \@perfdata, [ @longmsg ]
             if $w_count > 0;
     return ok $me, [ "Table bloat ok" ], \@perfdata;
 }
@@ -5443,8 +5895,8 @@ sub check_temp_files {
     my $c_flimit;
     my $w_limit;
     my $c_limit;
-    my $perf_flimits = '';
-    my $perf_limits  = '';
+    my @perf_flimits;
+    my @perf_limits;
     my $obj = 'database(s)';
     my @msg_crit;
     my @msg_warn;
@@ -5623,8 +6075,8 @@ sub check_temp_files {
         ) if (defined $w_limit and not defined $c_limit)
             or (not defined $w_limit and defined $c_limit);
 
-        $perf_flimits = ";$w_flimit;$c_flimit" if defined $w_flimit;
-        $perf_limits  = ";$w_limit;$c_limit" if defined $w_limit;
+        @perf_flimits = ( $w_flimit, $c_flimit ) if defined $w_flimit;
+        @perf_limits  = ( $w_limit, $c_limit ) if defined $w_limit;
     }
 
     %prev_temp_files = %{ load( $hosts[0], 'temp_files', $args{'status-file'} ) || {} };
@@ -5641,8 +6093,8 @@ DB_LOOP: foreach my $stat (@rs) {
         my $diff_size;
 
         if ( $stat->[0] eq 'live' ) {
-            push @perfdata => "'# files in $stat->[1]'=$stat->[2]File${perf_flimits}";
-            push @perfdata => "'Total size in $stat->[1]'=$stat->[3]B${perf_limits}";
+            push @perfdata => [ "# files in $stat->[1]", $stat->[2], 'File', @perf_flimits ];
+            push @perfdata => [ "Total size in $stat->[1]", $stat->[3], 'B', @perf_limits ];
 
             if ( defined $c_limit) {
                 if ( $stat->[3] > $c_limit ) {
@@ -5685,10 +6137,10 @@ DB_LOOP: foreach my $stat (@rs) {
         $frate = 60 * $diff_number / ($now - $last_check);
         $brate = 60 * $diff_size   / ($now - $last_check);
 
-        push @perfdata => "'$stat->[1]'=${frate}Fpm";
-        push @perfdata => "'$stat->[1]'=${brate}Bpm";
-        push @perfdata => "'$stat->[1]'=${diff_number}Files${perf_flimits}";
-        push @perfdata => "'$stat->[1]'=${diff_size}B${perf_limits}";
+        push @perfdata => [ "$stat->[1]", $frate, 'Fpm' ];
+        push @perfdata => [ "$stat->[1]", $brate, 'Bpm' ];
+        push @perfdata => [ "$stat->[1]", $diff_number, 'Files', @perf_flimits ];
+        push @perfdata => [ "$stat->[1]", $diff_size, 'B', @perf_limits ];
 
         if ( defined $c_limit) {
             if ( $diff_size > $c_limit ) {
@@ -5872,8 +6324,8 @@ sub check_wal_files {
 
     $seg_written = $num_seg - $seg_recycled;
 
-    push @perfdata => "total_wal=$num_seg";
-    push @perfdata => "recycled_wal=$seg_recycled";
+    push @perfdata => [ "total_wal", $num_seg, undef ];
+    push @perfdata => [ "recycled_wal", $seg_recycled ];
 
     # pay attention to the wal_keep_segment in perfdata
     if ( $hosts[0]{'version_num'} >= $PG_VERSION_90) {
@@ -5882,21 +6334,21 @@ sub check_wal_files {
             # cheet with numbers if the keep_segment was just set and the
             # number of wal doesn't match it yet.
             if ($seg_kept > $seg_written) {
-                push @perfdata => "written_wal=1";
-                push @perfdata => "kept_wal=". ($seg_written - 1);
+                push @perfdata => [ "written_wal", 1 ];
+                push @perfdata => [ "kept_wal", $seg_written - 1 ];
             }
             else {
-                push @perfdata => "written_wal=" . ($seg_written - $seg_kept);
-                push @perfdata => "kept_wal=$seg_kept";
+                push @perfdata => [ "written_wal", $seg_written - $seg_kept ];
+                push @perfdata => [ "kept_wal", $seg_kept ];
             }
         }
         else {
-            push @perfdata => "written_wal=$seg_written";
-            push @perfdata => "kept_wal=0";
+            push @perfdata => [ "written_wal", $seg_written ];
+            push @perfdata => [ "kept_wal", 0 ];
         }
     }
     else {
-        push @perfdata => "written_wal=$seg_written";
+        push @perfdata => [ "written_wal", $seg_written ];
     }
 
     push @msg => "$num_seg WAL files";
@@ -5913,7 +6365,7 @@ sub check_wal_files {
             my $rate = ($curr_lsn - $prev_lsn[1])/($now - $prev_lsn[0]);
             $rate = int($rate*100+0.5)/100;
 
-            push @perfdata => "wal_rate=${rate}Bps";
+            push @perfdata => [ "wal_rate", $rate, 'Bps' ];
         }
 
         save $hosts[0], 'last wal files LSN', [ $now, $curr_lsn ], $args{'status-file'};
@@ -5923,7 +6375,7 @@ sub check_wal_files {
         my $w_limit = get_size( $args{'warning'},  $max_segs );
         my $c_limit = get_size( $args{'critical'}, $max_segs );
 
-        $perfdata[0] .= ";$w_limit;$c_limit;1;$max_segs";
+        push @{ $perfdata[0] } => ( $w_limit, $c_limit, 1, $max_segs );
 
         return critical( $me, \@msg, \@perfdata ) if $num_seg >= $c_limit;
         return warning( $me, \@msg, \@perfdata )  if $num_seg >= $w_limit;
@@ -5942,46 +6394,50 @@ sub check_wal_files {
 Getopt::Long::Configure('bundling');
 GetOptions(
     \%args,
-        'service|s=s',
-        'host|h=s',
-        'username|U=s',
-        'password=s',
-        'port|p=s',
-        'dbname|d=s',
-        'dbservice|S=s',
-        'warning|w=s',
-        'critical|c=s',
-        'exclude=s',
-        'tmpdir=s',
-        'psql|P=s',
-        'path=s',
-        'status-file=s',
-        'query=s',
-        'type=s',
-        'reverse!',
-        'work_mem=i',
-        'maintenance_work_mem=i',
-        'shared_buffers=i',
-        'wal_buffers=i',
         'checkpoint_segments=i',
-        'effective_cache_size=i',
-        'no_check_autovacuum!',
-        'no_check_fsync!',
-        'no_check_enable!',
-        'no_check_track_counts!',
-        'ignore-wal-size!',
-        'suffix=s',
-        'slave=s',
-        'list|l!',
-        'version|V!',
-        'help|?!',
-        'debug!',
-        'pattern=s',
-        'global-pattern=s',
-        'timeout|t=s',
+        'critical|c=s',
         'dbexclude=s',
         'dbinclude=s',
-        'dump-status-file!'
+        'debug!',
+        'dump-status-file!',
+        'dump-bin-file:s',
+        'effective_cache_size=i',
+        'exclude=s',
+        'format|F=s',
+        'global-pattern=s',
+        'help|?!',
+        'host|h=s',
+        'password=s',
+        'ignore-wal-size!',
+        'dbname|d=s',
+        'dbservice|S=s',
+        'list|l!',
+        'maintenance_work_mem=i',
+        'no_check_autovacuum!',
+        'no_check_enable!',
+        'no_check_fsync!',
+        'no_check_track_counts!',
+        'output|o=s',
+        'path=s',
+        'pattern=s',
+        'port|p=s',
+        'psql|P=s',
+        'query=s',
+        'reverse!',
+        'save!',
+        'service|s=s',
+        'shared_buffers=i',
+        'slave=s',
+        'status-file=s',
+        'suffix=s',
+        'timeout|t=s',
+        'tmpdir=s',
+        'type=s',
+        'username|U=s',
+        'version|V!',
+        'wal_buffers=i',
+        'warning|w=s',
+        'work_mem=i'
 ) or pod2usage( -exitval => 127 );
 
 list_services() if $args{'list'};
@@ -5989,7 +6445,8 @@ version()       if $args{'version'};
 
 pod2usage( -verbose => 2 ) if $args{'help'};
 
-dump_status_file() if $args{'dump-status-file'};
+dump_status_file( $args{'dump-bin-file'} ) if $args{'dump-status-file'}
+                                           or defined $args{'dump-bin-file'};
 
 
 # One service must be given
@@ -6073,6 +6530,21 @@ unless ( $args{'service'} eq 'pg_dump_backup' ) {
 
 $_ = qr/$_/ for @{ $args{'dbexclude'} };
 
+# Output format
+for ( $args{'format'} ) {
+       if ( /^binary$/        ) { $output_fmt = \&bin_output  }
+    elsif ( /^debug$/         ) { $output_fmt = \&debug_output  }
+    elsif ( /^human$/         ) { $output_fmt = \&human_output  }
+    elsif ( /^nagios$/        ) { $output_fmt = \&nagios_output }
+    elsif ( /^nagios_strict$/ ) { $output_fmt = \&nagios_strict_output }
+    else {
+        pod2usage(
+            -message => "FATAL: unrecognized output format \"$_\" (see \"--format\")",
+            -exitval => 127
+        );
+    }
+}
+
 exit $services{ $args{'service'} }{'sub'}->( \%args );
 
 __END__
@@ -6083,7 +6555,7 @@ __END__
 
 =item Execute service "last_vacuum" on host "host=localhost port=5432":
 
-  check_pgactivity -h localhost -p 5492 -s last_vacuum -w 30m -c 1h30m
+  check_pgactivity -h localhost -p 5432 -s last_vacuum -w 30m -c 1h30m
 
 =item Execute service "hot_standby_delta" between hosts "service=pg92" and "service=pg92s":
 
@@ -6105,7 +6577,7 @@ __END__
 
 =head2 VERSION
 
-check_pgactivity version 1.25, released on Thu Jan 28 2016.
+check_pgactivity version 2.0, released on Mon Aug 29 2016.
 
 =head2 LICENSING
 
